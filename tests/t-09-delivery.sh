@@ -2,10 +2,8 @@
 . "$(dirname "$0")/common.sh"
 setup
 trap teardown EXIT
-source_monitor
 PASEO_MONITOR_LOG_MAX_BYTES=100000
 export PASEO_MONITOR_LOG_MAX_BYTES
-unset PM_SOURCE_ONLY
 
 cat > "$SANDBOX/mode" <<'EOF'
 RUNNING

@@ -2,8 +2,6 @@
 . "$(dirname "$0")/common.sh"
 setup
 trap teardown EXIT
-source_monitor
-unset PM_SOURCE_ONLY
 cat > "$SANDBOX/probe" <<'EOF'
 #!/bin/sh
 printf 'OLD snapshotted-detail\n'

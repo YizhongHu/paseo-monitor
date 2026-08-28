@@ -4,8 +4,6 @@ setup
 trap teardown EXIT
 PASEO_MONITOR_LOG_MAX_BYTES=100000
 export PASEO_MONITOR_LOG_MAX_BYTES
-source_monitor
-unset PM_SOURCE_ONLY
 
 cat > "$MOCK_DIR/inspect.json" <<'EOF'
 {"Status":"RUNNING","Labels":{"role":"monitor","job":"42124320","item":"a1913cc1","lane":"F2"}}

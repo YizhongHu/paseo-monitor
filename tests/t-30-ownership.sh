@@ -4,8 +4,6 @@ setup
 trap teardown EXIT
 PASEO_MONITOR_LOG_MAX_BYTES=100000
 export PASEO_MONITOR_LOG_MAX_BYTES
-source_monitor
-unset PM_SOURCE_ONLY
 
 cat > "$SANDBOX/probe" <<'EOF'
 #!/bin/sh
@@ -56,8 +54,8 @@ assert_grep "$SANDBOX/rm-global" "will-remove watch=$first_id owner=owner-a repo
 assert_grep "$SANDBOX/rm-global" "removed watch=$first_id owner=owner-a report_to=route-a" "global deletion receipt"
 [ -f "$PM_HOME/graveyard/$first_id/spec" ] || fail "global rm did not archive owner-a watch"
 
-old_deadline=$(( $(pm_now) - 2592001 ))
-pm_atomic_write "$PM_HOME/graveyard/$first_id/spec" "$(sed "s/^deadline=.*/deadline=$old_deadline/" "$PM_HOME/graveyard/$first_id/spec")"
+old_deadline=$(( $(date +%s) - 2592001 ))
+printf '%s\n' "$(sed "s/^deadline=.*/deadline=$old_deadline/" "$PM_HOME/graveyard/$first_id/spec")" > "$PM_HOME/graveyard/$first_id/spec"
 $PMT_BIN reap > "$SANDBOX/reap" || fail "graveyard reap failed"
 [ ! -d "$PM_HOME/graveyard/$first_id" ] || fail "expired graveyard entry survived reap"
 echo PASS: ownership-scoped rm, attribution, graveyard fallback, global listing, and graveyard reap

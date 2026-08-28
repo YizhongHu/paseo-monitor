@@ -6,8 +6,6 @@ PASEO_MONITOR_LOG_MAX_BYTES=100000
 export PASEO_MONITOR_LOG_MAX_BYTES
 PASEO_MONITOR_BACKOFF_SCALE=1
 export PASEO_MONITOR_BACKOFF_SCALE
-source_monitor
-unset PM_SOURCE_ONLY
 
 cat > "$SANDBOX/mode" <<'EOF'
 RUNNING
@@ -32,7 +30,7 @@ fi
 deadline_reg="$($PMT_BIN watch --script "$SANDBOX/probe" --reason 'deadline test' --terminal DONE --no-start-report --deadline +300)" || fail "deadline registration failed"
 deadline_id=$(printf '%s\n' "$deadline_reg" | sed -n 's/^watch \([^ ]*\) registered.*/\1/p')
 deadline_dir="$PM_HOME/watches/$deadline_id"
-pm_atomic_write "$deadline_dir/spec" "$(sed 's/^deadline=.*/deadline=1/' "$deadline_dir/spec")"
+printf '%s\n' "$(sed 's/^deadline=.*/deadline=1/' "$deadline_dir/spec")" > "$deadline_dir/spec"
 $PMT_BIN _sweep || fail "deadline sweep failed"
 $PMT_BIN _sweep || fail "deadline repeat sweep failed"
 assert_eq "$(cat "$deadline_dir/state")" expired "deadline state"
@@ -49,11 +47,11 @@ auth_dir="$PM_HOME/watches/$auth_id"
 printf 'AUTH\n' > "$SANDBOX/mode"
 : > "$SANDBOX/probe-calls"
 # The probe itself is snapshotted; count invocations by replacing the source
-pm_atomic_write "$auth_dir/nextDue" 0
+printf '%s\n' 0 > "$auth_dir/nextDue"
 $PMT_BIN _sweep || fail "auth strike one failed"
-pm_atomic_write "$auth_dir/nextDue" 0
+printf '%s\n' 0 > "$auth_dir/nextDue"
 $PMT_BIN _sweep || fail "auth strike two failed"
-pm_atomic_write "$auth_dir/nextDue" 0
+printf '%s\n' 0 > "$auth_dir/nextDue"
 $PMT_BIN _sweep || fail "auth strike three failed"
 assert_eq "$(cat "$auth_dir/health")" '3 auth' "auth health strikes"
 assert_eq "$(cat "$auth_dir/state")" parked "auth park"
@@ -61,7 +59,7 @@ assert_grep "$auth_dir/log" 'PARKED auth failures=3' "auth park evidence"
 printf 'RUNNING\n' > "$SANDBOX/mode"
 $PMT_BIN _sweep || fail "parked auth sweep failed"
 assert_eq "$(cat "$auth_dir/health")" '3 auth' "parked watch not probed"
-pm_atomic_write "$auth_dir/spec" "$(sed 's/^deadline=.*/deadline=1/' "$auth_dir/spec")"
+printf '%s\n' "$(sed 's/^deadline=.*/deadline=1/' "$auth_dir/spec")" > "$auth_dir/spec"
 $PMT_BIN _sweep || fail "parked deadline sweep failed"
 assert_eq "$(cat "$auth_dir/state")" expired "parked deadline expiry"
 assert_grep "$auth_dir/log" 'REPORT .*class=deadline' "parked deadline report"
@@ -69,8 +67,8 @@ assert_grep "$auth_dir/log" 'REPORT .*class=deadline' "parked deadline report"
 # poke resumes a parked watch and performs an immediate healthy observation.
 printf 'RUNNING\n' > "$SANDBOX/mode"
 # Restore a future deadline and parked state for the explicit resume check.
-pm_atomic_write "$auth_dir/spec" "$(sed 's/^deadline=.*/deadline=9999999999/' "$auth_dir/spec")"
-pm_atomic_write "$auth_dir/state" parked
+printf '%s\n' "$(sed 's/^deadline=.*/deadline=9999999999/' "$auth_dir/spec")" > "$auth_dir/spec"
+printf '%s\n' parked > "$auth_dir/state"
 $PMT_BIN poke "$auth_id" || fail "poke failed"
 assert_eq "$(cat "$auth_dir/state")" active "poke resumes park"
 assert_eq "$(cat "$auth_dir/health")" '0 healthy' "poke healthy observation"
@@ -79,26 +77,26 @@ config_reg="$($PMT_BIN watch --script "$SANDBOX/probe" --reason 'config test' --
 config_id=$(printf '%s\n' "$config_reg" | sed -n 's/^watch \([^ ]*\) registered.*/\1/p')
 config_dir="$PM_HOME/watches/$config_id"
 printf 'CONFIG\n' > "$SANDBOX/mode"
-pm_atomic_write "$config_dir/nextDue" 0
+printf '%s\n' 0 > "$config_dir/nextDue"
 $PMT_BIN _sweep || fail "config strike failed"
 assert_eq "$(cat "$config_dir/health")" '1 config' "rc=127 config class"
 assert_grep "$config_dir/log" 'PROBE-FAIL class=config count=1 rc=127' "config failure evidence"
 if grep -q 'class=network.*rc=127' "$config_dir/log"; then fail "rc=127 classified as network"; fi
-pm_atomic_write "$config_dir/nextDue" 0
+printf '%s\n' 0 > "$config_dir/nextDue"
 $PMT_BIN _sweep || fail "config strike two failed"
-pm_atomic_write "$config_dir/nextDue" 0
+printf '%s\n' 0 > "$config_dir/nextDue"
 $PMT_BIN _sweep || fail "config strike three failed"
 assert_eq "$(cat "$config_dir/health")" '3 config' "config health strikes"
 assert_eq "$(cat "$config_dir/state")" parked "config failure parks"
 assert_grep "$config_dir/log" 'PARKED config failures=3' "config park evidence"
-pm_atomic_write "$config_dir/spec" "$(sed 's/^deadline=.*/deadline=1/' "$config_dir/spec")"
+printf '%s\n' "$(sed 's/^deadline=.*/deadline=1/' "$config_dir/spec")" > "$config_dir/spec"
 $PMT_BIN _sweep || fail "parked config deadline sweep failed"
 assert_eq "$(cat "$config_dir/state")" expired "parked config deadline expiry"
 assert_grep "$config_dir/log" 'REPORT .*class=deadline' "parked config deadline report"
 assert_grep "$config_dir/log" 'could not determine state; last observation RUNNING; last probe failure class=config count=3 rc=127' "deadline failure diagnosis"
 printf 'RUNNING\n' > "$SANDBOX/mode"
-pm_atomic_write "$config_dir/spec" "$(sed 's/^deadline=.*/deadline=9999999999/' "$config_dir/spec")"
-pm_atomic_write "$config_dir/state" parked
+printf '%s\n' "$(sed 's/^deadline=.*/deadline=9999999999/' "$config_dir/spec")" > "$config_dir/spec"
+printf '%s\n' parked > "$config_dir/state"
 $PMT_BIN poke "$config_id" || fail "config poke failed"
 assert_eq "$(cat "$config_dir/state")" active "config poke resumes park"
 assert_eq "$(cat "$config_dir/health")" '0 healthy' "config poke healthy observation"
@@ -108,11 +106,11 @@ network_reg="$($PMT_BIN watch --script "$SANDBOX/probe" --reason 'network test' 
 network_id=$(printf '%s\n' "$network_reg" | sed -n 's/^watch \([^ ]*\) registered.*/\1/p')
 printf 'NET\n' > "$SANDBOX/mode"
 network_dir="$PM_HOME/watches/$network_id"
-pm_atomic_write "$network_dir/nextDue" 0
+printf '%s\n' 0 > "$network_dir/nextDue"
 $PMT_BIN _sweep || fail "network strike one failed"
-pm_atomic_write "$network_dir/nextDue" 0
+printf '%s\n' 0 > "$network_dir/nextDue"
 $PMT_BIN _sweep || fail "network strike two failed"
-pm_atomic_write "$network_dir/nextDue" 0
+printf '%s\n' 0 > "$network_dir/nextDue"
 $PMT_BIN _sweep || fail "network strike three failed"
 assert_eq "$(cat "$network_dir/state")" active "network does not park"
 assert_eq "$(cat "$network_dir/health")" '3 network' "network health strikes"

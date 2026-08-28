@@ -4,8 +4,6 @@ setup
 trap teardown EXIT
 PASEO_MONITOR_LOG_MAX_BYTES=100000
 export PASEO_MONITOR_LOG_MAX_BYTES
-source_monitor
-unset PM_SOURCE_ONLY
 export PASEO_AGENT_ID=cli-test
 
 kinds="$($PMT_BIN kinds)"
@@ -70,33 +68,33 @@ log_out="$($PMT_BIN log "$watch_id" -n 3)"
 printf '%s\n' "$log_out" > "$SANDBOX/log"
 assert_grep "$SANDBOX/log" 'REGISTER' "log output"
 
-pm_atomic_write "$watch_dir/state" parked
-pm_status "$watch_id" > "$SANDBOX/parked-status.out" 2> "$SANDBOX/parked-status.err"
+printf '%s\n' parked > "$watch_dir/state"
+$PMT_BIN status "$watch_id" > "$SANDBOX/parked-status.out" 2> "$SANDBOX/parked-status.err"
 assert_grep "$SANDBOX/parked-status.err" 'state=parked; will not probe until poked' "parked status diagnosis"
 poke_out="$($PMT_BIN poke "$watch_id")" || fail "poke failed"
 assert_eq "$(cat "$watch_dir/state")" active "poke resumes parked watch"
 assert_grep "$watch_dir/log" 'POKE resumed parked watch' "poke park resume"
-pm_atomic_write "$watch_dir/state" delivery-failed
-pm_atomic_write "$watch_dir/.delivery.stderr" 'delivery backend exploded rc=9'
-pm_atomic_write "$watch_dir/undelivered" 'pending report'
+printf '%s\n' delivery-failed > "$watch_dir/state"
+printf '%s\n' 'delivery backend exploded rc=9' > "$watch_dir/.delivery.stderr"
+printf '%s\n' 'pending report' > "$watch_dir/undelivered"
 $PMT_BIN status "$watch_id" > "$SANDBOX/delivery-status.out" 2> "$SANDBOX/delivery-status.err"
 assert_grep "$SANDBOX/delivery-status.out" 'undelivered=yes.*delivery_error=delivery backend exploded rc=9' "status delivery error"
 assert_grep "$SANDBOX/delivery-status.out" "sweeper_log=$PM_HOME/sweep.log" "status sweeper log pointer"
-pm_atomic_write "$watch_dir/health" '1 network'
+printf '%s\n' '1 network' > "$watch_dir/health"
 $PMT_BIN status "$watch_id" > "$SANDBOX/warn.out" 2> "$SANDBOX/warn.err"
 assert_grep "$SANDBOX/warn.err" 'WARN watch=' "status warning stream"
 assert_grep "$SANDBOX/warn.err" 'health=1 network' "health warning"
 
 old_id="$($PMT_BIN watch --script "$SANDBOX/probe" --reason old --terminal DONE --deadline +300 | sed -n 's/^watch \([^ ]*\) registered.*/\1/p')" || fail "old watch registration failed"
 old_dir="$PM_HOME/watches/$old_id"
-pm_atomic_write "$old_dir/state" terminal
-old_deadline=$(( $(pm_now) - 2592001 ))
-pm_atomic_write "$old_dir/spec" "$(sed "s/^deadline=.*/deadline=$old_deadline/" "$old_dir/spec")"
+printf '%s\n' terminal > "$old_dir/state"
+old_deadline=$(( $(date +%s) - 2592001 ))
+printf '%s\n' "$(sed "s/^deadline=.*/deadline=$old_deadline/" "$old_dir/spec")" > "$old_dir/spec"
 recent_id="$($PMT_BIN watch --script "$SANDBOX/probe" --reason recent --terminal DONE --deadline +300 | sed -n 's/^watch \([^ ]*\) registered.*/\1/p')" || fail "recent watch registration failed"
 recent_dir="$PM_HOME/watches/$recent_id"
-pm_atomic_write "$recent_dir/state" terminal
-recent_deadline=$(( $(pm_now) - 2591900 ))
-pm_atomic_write "$recent_dir/spec" "$(sed "s/^deadline=.*/deadline=$recent_deadline/" "$recent_dir/spec")"
+printf '%s\n' terminal > "$recent_dir/state"
+recent_deadline=$(( $(date +%s) - 2591900 ))
+printf '%s\n' "$(sed "s/^deadline=.*/deadline=$recent_deadline/" "$recent_dir/spec")" > "$recent_dir/spec"
 reap_out="$($PMT_BIN reap)"
 printf '%s\n' "$reap_out" > "$SANDBOX/reap"
 [ ! -d "$old_dir" ] || fail "long-expired watch retained"

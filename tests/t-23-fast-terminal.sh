@@ -4,8 +4,6 @@ setup
 trap teardown EXIT
 PASEO_MONITOR_LOG_MAX_BYTES=100000
 export PASEO_MONITOR_LOG_MAX_BYTES
-source_monitor
-unset PM_SOURCE_ONLY
 tab="$(printf '\t')"
 
 cat > "$SANDBOX/probe" <<'EOF'
@@ -33,7 +31,7 @@ assert_grep "$MOCK_DIR/calls.log" 'paseo schedule delete ' "immediate failsafe c
 [ ! -f "$script_dir/failsafe" ] || fail "immediate terminal retains failsafe marker"
 
 printf '0\n' > "$script_dir/nextDue"
-pm_atomic_write "$script_dir/spec" "$(sed 's/^deadline=.*/deadline=0/' "$script_dir/spec")"
+printf '%s\n' "$(sed 's/^deadline=.*/deadline=0/' "$script_dir/spec")" > "$script_dir/spec"
 $PMT_BIN _sweep || fail "terminal script follow-up sweep failed"
 assert_eq "$(grep -c ' REPORT ' "$script_dir/log")" 2 "script terminal does not re-report"
 if grep -q 'class=deadline' "$script_dir/log"; then fail "terminal script emitted deadline event"; fi

@@ -4,8 +4,6 @@ setup
 trap teardown EXIT
 PASEO_MONITOR_LOG_MAX_BYTES=100000
 export PASEO_MONITOR_LOG_MAX_BYTES
-source_monitor
-unset PM_SOURCE_ONLY
 export PASEO_AGENT_ID=cancellation-test
 
 cat > "$SANDBOX/probe" <<'EOF'
@@ -80,9 +78,9 @@ reap_reg="$($PMT_BIN watch --script "$SANDBOX/probe" --reason 'reap failsafe cle
 reap_id=$(printf '%s\n' "$reap_reg" | sed -n 's/^watch \([^ ]*\) registered.*/\1/p')
 reap_dir="$PM_HOME/watches/$reap_id"
 reap_schedule=$(cat "$reap_dir/failsafe")
-pm_atomic_write "$reap_dir/state" terminal
-reap_deadline=$(( $(pm_now) - 2592001 ))
-pm_atomic_write "$reap_dir/spec" "$(sed "s/^deadline=.*/deadline=$reap_deadline/" "$reap_dir/spec")"
+printf '%s\n' terminal > "$reap_dir/state"
+reap_deadline=$(( $(date +%s) - 2592001 ))
+printf '%s\n' "$(sed "s/^deadline=.*/deadline=$reap_deadline/" "$reap_dir/spec")" > "$reap_dir/spec"
 $PMT_BIN reap || fail "reap failed"
 assert_eq "$(count_reports "$MOCK_DIR/reports")" 0 "reap report count"
 assert_grep "$MOCK_DIR/calls.log" "paseo schedule delete $reap_schedule" "reap schedule cleanup"

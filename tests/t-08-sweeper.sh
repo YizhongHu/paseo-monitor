@@ -4,8 +4,6 @@ setup
 trap teardown EXIT
 PASEO_MONITOR_LOG_MAX_BYTES=100000
 export PASEO_MONITOR_LOG_MAX_BYTES
-source_monitor
-unset PM_SOURCE_ONLY
 
 write_probe() {
     wt_path="$1"
@@ -19,18 +17,32 @@ EOF
 
 # A held live global lock makes _sweep skip quietly.
 printf 'LOCKED\n' > "$SANDBOX/lock-mode"
-write_probe "$SANDBOX/lock-probe" "$SANDBOX/lock-mode"
+cat > "$SANDBOX/lock-probe" <<EOF
+#!/bin/sh
+printf '%s detail-%s\n' "\$(cat '$SANDBOX/lock-mode')" "\$(cat '$SANDBOX/lock-mode')"
+sleep 2
+EOF
+chmod +x "$SANDBOX/lock-probe"
 lock_registration="$($PMT_BIN watch --script "$SANDBOX/lock-probe" --reason 'lock test' --terminal DONE --no-start-report --deadline +300)" || fail "lock watch registration failed"
 lock_id=$(printf '%s\n' "$lock_registration" | sed -n 's/^watch \([^ ]*\) registered.*/\1/p')
 lock_dir="$PM_HOME/watches/$lock_id"
-sh -c 'PM_SOURCE_ONLY=1; export PM_SOURCE_ONLY; . "$1"; acquire_lock "$2"; sleep 2' sh "$PMT_BIN" "$PM_HOME" &
+$PMT_BIN _sweep > "$SANDBOX/lock-holder.out" 2> "$SANDBOX/lock-holder.err" &
 holder=$!
-sleep 1
+lock_ready=0
+lock_attempt=0
+while [ "$lock_attempt" -lt 20 ]; do
+    if [ -d "$PM_HOME/sweep.lock" ]; then
+        lock_ready=1
+        break
+    fi
+    sleep 0.1
+    lock_attempt=$((lock_attempt + 1))
+done
+[ "$lock_ready" -eq 1 ] || fail "lock-holder sweep did not acquire lock"
 sweep_output="$($PMT_BIN _sweep)" || fail "lock skip returned nonzero"
 [ -z "$sweep_output" ] || fail "lock skip was noisy: $sweep_output"
 assert_eq "$(cat "$lock_dir/last")" LOCKED "held lock skipped watch"
-kill "$holder" 2>/dev/null || true
-wait "$holder" 2>/dev/null || true
+wait "$holder" 2>/dev/null || fail "lock-holder sweep failed"
 
 # Intermediate changes always enter the evidence log, but report only when opted in.
 printf 'RUNNING\n' > "$SANDBOX/default-mode"
