@@ -19,6 +19,7 @@ import sys
 import tempfile
 import threading
 import time
+import uuid
 import zlib
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
@@ -452,8 +453,9 @@ def pm_parse_probe_output(source):
 def _classify_ssh_error(text):
     lowered = text.lower()
     return "auth" if any(word in lowered for word in (
-        "authentication", "permission denied", "passphrase", "password",
-        "verification", "mfa", "keyboard-interactive",
+        "authentication", "permission denied", "permission", "auth ",
+        "auth:", "passphrase", "password", "verification",
+        "mfa", "keyboard-interactive",
     )) else "network"
 
 
@@ -465,7 +467,8 @@ def health_failure_class(returncode, stderr):
     if returncode == 127:
         return "config"
     if returncode == 255 and any(word in lowered for word in (
-        "authentication", "permission", "auth", "assword", "passphrase", "verification",
+        "authentication", "permission", "auth", "assword", "passphrase",
+        "verification", "mfa", "keyboard-interactive",
     )):
         return "auth"
     return "network"
@@ -518,10 +521,21 @@ def parse_slurm_probe_output(watch_dir, output_path):
             if squeue.split("|", 1)[0] == "PENDING" and "|" in squeue:
                 token = "PENDING:" + squeue.split("|", 1)[1]
             detail += " squeue=%s" % squeue
-    elif marker and (Path(watch_dir) / "last").read_text(encoding="utf-8", errors="replace").strip() not in ("", "PENDING"):
-        token, detail = "VANISHED", "sacct and squeue empty after last=%s" % (Path(watch_dir) / "last").read_text().strip()
     else:
-        token, detail = "PENDING", "sacct empty (accounting lag); squeue=%s" % squeue
+        last_path = Path(watch_dir) / "last"
+        last = last_path.read_text(
+            encoding="utf-8", errors="replace"
+        ).strip() if last_path.is_file() else ""
+        detail_path = Path(watch_dir) / "detail"
+        prior_detail = detail_path.read_text(
+            encoding="utf-8", errors="replace"
+        ) if detail_path.is_file() else ""
+        queue_match = re.search(r"(?:^| )squeue=([^ ]*)", prior_detail)
+        prior_queue = bool(queue_match and queue_match.group(1).split("|", 1)[0])
+        if marker and last not in ("", "PENDING") and prior_queue:
+            token, detail = "VANISHED", "sacct and squeue empty after last=%s" % last
+        else:
+            token, detail = "PENDING", "sacct empty (accounting lag); squeue=%s" % squeue
     atomic_write(output_path, "%s %s" % (token, detail))
 
 
@@ -551,13 +565,12 @@ def parse_pbs_probe_output(watch_dir, output_path):
         atomic_write(output_path, "UNKNOWN qstat live and historical lookup empty")
 
 
-def pm_pbs_probe_output(watch_dir, output_path):
-    return parse_pbs_probe_output(watch_dir, output_path)
-
-
 def _json_data(value):
     if hasattr(value, "read"):
         return json.load(value)
+    if isinstance(value, os.PathLike):
+        with open(str(value), "r", encoding="utf-8") as handle:
+            return json.load(handle)
     if isinstance(value, (bytes, str)):
         text = value.decode("utf-8") if isinstance(value, bytes) else value
         if os.path.isfile(text):
@@ -565,6 +578,113 @@ def _json_data(value):
                 return json.load(handle)
         return json.loads(text)
     return value
+
+
+def _json_object(source):
+    value = _json_data(source)
+    if not isinstance(value, dict):
+        raise ValueError("probe JSON must be an object")
+    return value
+
+
+def parse_agent_probe_output(source):
+    """Map the observable paseo inspect fields to a stable watch token."""
+    agent = _json_object(source)
+    status = str(agent.get("Status", agent.get("status", "UNKNOWN"))).upper()
+    archived = bool(agent.get("Archived", agent.get("archived", False)))
+    archived = archived or bool(agent.get("ArchivedAt", agent.get("archivedAt", "")))
+    permissions = agent.get("PendingPermissions", agent.get("pendingPermissions", []))
+    if not isinstance(permissions, list):
+        permissions = []
+    updated = str(agent.get("UpdatedAt", agent.get("updatedAt", "")))
+    token = "ARCHIVED" if archived else (
+        "BLOCKED-PERMISSION" if permissions else status
+    )
+    prefix = "went idle " if token == "IDLE" else ""
+    idle = " idle_since=%s" % updated if token == "IDLE" else ""
+    detail = (
+        "%sstatus=%s archived=%s pendingPermissions=%d queue_depth=%d "
+        "updated_at=%s%s"
+        % (prefix, status, str(archived).lower(), len(permissions),
+           len(permissions), updated, idle)
+    )
+    return ProbeObservation(token, detail)
+
+
+def parse_globus_probe_output(source):
+    data = _json_object(source)
+
+    def field(name):
+        value = data.get(name, "")
+        if value is None:
+            return ""
+        if isinstance(value, (dict, list)):
+            return json.dumps(value, separators=(",", ":"))
+        return str(value).replace("\n", " ")
+
+    status = str(data.get("status", data.get("Status", "UNKNOWN"))).upper()
+    if status not in ("ACTIVE", "INACTIVE", "SUCCEEDED", "FAILED"):
+        status = "UNKNOWN"
+    detail = "nice_status=%s faults=%s fatal_error=%s effective_bytes_per_second=%s" % (
+        field("nice_status"), field("faults"), field("fatal_error"),
+        field("effective_bytes_per_second"),
+    )
+    return ProbeObservation(status, detail)
+
+
+def parse_git_ref_probe_output(watch_dir, output_path):
+    lines = Path(output_path).read_text(
+        encoding="utf-8", errors="replace"
+    ).splitlines()
+    line = _first_nonempty(lines)
+    fields = line.split("\t")
+    sha = fields[0] if fields else ""
+    if not re.match(r"^[0-9A-Fa-f]+$", sha):
+        raise ValueError("git ls-remote returned no SHA")
+    ref = fields[1] if len(fields) > 1 else ""
+    last_path = Path(watch_dir) / "last"
+    old = last_path.read_text(encoding="utf-8", errors="replace").strip() if last_path.is_file() else ""
+    if not old:
+        old = sha
+    detail = "old=%s new=%s ref=%s observed=%s" % (old, sha, ref, line)
+    return ProbeObservation(sha, detail)
+
+
+def parse_pr_merge_probe_output(source):
+    line = _first_nonempty(Path(source).read_text(
+        encoding="utf-8", errors="replace"
+    ).splitlines())
+    if not line:
+        raise ValueError("gh returned no pull request state")
+    state = line.split()[0].upper()
+    return ProbeObservation(state, "state=%s" % state)
+
+
+def parse_file_exists_probe_output(path, observed_path):
+    lines = Path(observed_path).read_text(
+        encoding="utf-8", errors="replace"
+    ).splitlines()
+    return ProbeObservation("EXISTS", lines[0] if lines else str(path))
+
+
+def pm_agent_probe_output(source):
+    return parse_agent_probe_output(source)
+
+
+def pm_globus_probe_output(source):
+    return parse_globus_probe_output(source)
+
+
+def pm_git_ref_probe_output(watch_dir, output_path):
+    observation = parse_git_ref_probe_output(watch_dir, output_path)
+    atomic_write(output_path, "%s %s" % (observation.token, observation.detail))
+    return observation
+
+
+def pm_pr_merge_probe_output(source):
+    return parse_pr_merge_probe_output(source)
+
+
 
 
 def match_agent(data, query):
@@ -627,39 +747,354 @@ def resolve_agent(query, allow_orphan=False, home=PM_HOME, paseo_bin="paseo"):
     raise AgentResolutionError('paseo-monitor: no agent matches "%s"' % query)
 
 
+def resolve_binary(name, environ=None):
+    """Resolve a helper once, returning an executable absolute path."""
+    if not name:
+        raise FileNotFoundError("empty helper name")
+    if os.path.dirname(name):
+        candidate = os.path.abspath(name)
+        if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+            return candidate
+        raise FileNotFoundError(name)
+    env = os.environ if environ is None else environ
+    for directory in env.get("PATH", "").split(os.pathsep):
+        directory = directory or os.curdir
+        candidate = os.path.abspath(os.path.join(directory, name))
+        if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+            return candidate
+    raise FileNotFoundError(name)
+
+
+def _helper_for_kind(kind, spec):
+    helper = spec.get("helper", "")
+    if helper:
+        return helper
+    names = {"agent": "paseo", "globus": "globus", "pr-merge": "gh"}
+    return resolve_binary(names[kind]) if kind in names else ""
+
+
+def _shell_quote(value):
+    import shlex
+    return shlex.quote(str(value))
+
+
+def _probe_helper(kind, spec, err):
+    try:
+        return _helper_for_kind(kind, spec)
+    except FileNotFoundError:
+        name = spec.get("helper") or {
+            "agent": "paseo", "globus": "globus", "pr-merge": "gh"
+        }.get(kind, kind)
+        Path(err).write_text("required helper not found: %s\n" % name)
+        return None
+
+
 def _spec_probe(directory, spec, out, err, config):
+    """Run exactly one registered probe and normalize its observation."""
     kind = spec.get("kind", "")
     if kind == "script":
-        return run_with_timeout(config.probe_timeout, out, err, str(Path(directory) / "probe"), config=config)
+        return run_with_timeout(
+            config.probe_timeout, out, err, str(Path(directory) / "probe"),
+            config=config,
+        )
     if kind == "file-exists":
         if spec.get("host"):
-            rc = run_remote_probe(out, err, spec["host"], "ls", "-d", spec.get("path", ""), config=config)
+            rc = run_remote_probe(
+                out, err, spec["host"], "ls", "-d", spec.get("path", ""),
+                config=config,
+            )
         else:
-            rc = run_with_timeout(config.probe_timeout, out, err, "ls", "-d", spec.get("path", ""), config=config)
+            rc = run_with_timeout(
+                config.probe_timeout, out, err, "ls", "-d",
+                spec.get("path", ""), config=config,
+            )
         if rc == 0:
-            first = Path(out).read_text(encoding="utf-8", errors="replace").splitlines()
-            atomic_write(out, "EXISTS %s" % (first[0] if first else spec.get("path", "")))
+            observation = parse_file_exists_probe_output(spec.get("path", ""), out)
+            atomic_write(out, "%s %s" % (observation.token, observation.detail))
             return 0
+        # A remote health failure is never mistaken for target absence.
         if spec.get("host") and rc == 255:
             return rc
         atomic_write(out, "ABSENT %s" % spec.get("path", ""))
         return 0
-    if kind in ("slurm", "pbs"):
-        if kind == "slurm":
-            rc = run_remote_probe(out, err, spec.get("host", ""), "sacct", "-X", "-j", spec.get("job", ""), "--parsable2", "--noheader", "--format=State", config=config)
-            if rc == 0:
-                parse_slurm_probe_output(directory, out)
-            return rc
-        command = "qstat -f '%s' || { printf '\\nPASEO_MONITOR_PBS_HISTORICAL\\n'; qstat -x '%s'; :; }" % (spec.get("job", ""), spec.get("job", ""))
-        rc = run_remote_probe(out, err, spec.get("host", ""), command, config=config)
+    if kind == "slurm":
+        host, job = spec.get("host", ""), spec.get("job", "")
+        if str(spec.get("with_reason", "")) in ("1", "true", "True"):
+            quoted = _shell_quote(job)
+            command = (
+                "sacct -X -j %s --parsable2 --noheader --format=State; "
+                "pr_sacct_rc=$?; printf '\\nPASEO_MONITOR_SQUEUE\\n'; "
+                "squeue -h -j %s -o '%%T|%%R'; pr_squeue_rc=$?; "
+                "[ $pr_sacct_rc -eq 0 ] && [ $pr_squeue_rc -eq 0 ]"
+            ) % (quoted, quoted)
+            rc = run_remote_probe(out, err, host, command, config=config)
+        else:
+            rc = run_remote_probe(
+                out, err, host, "sacct", "-X", "-j", job, "--parsable2",
+                "--noheader", "--format=State", config=config,
+            )
+        if rc == 0:
+            parse_slurm_probe_output(directory, out)
+        return rc
+    if kind == "pbs":
+        job = _shell_quote(spec.get("job", ""))
+        command = (
+            "qstat -f %s || { printf '\\nPASEO_MONITOR_PBS_HISTORICAL\\n'; "
+            "qstat -x %s; :; }"
+        ) % (job, job)
+        rc = run_remote_probe(
+            out, err, spec.get("host", ""), command, config=config
+        )
         if rc == 0:
             parse_pbs_probe_output(directory, out)
         return rc
+    if kind == "agent":
+        helper = _probe_helper(kind, spec, err)
+        if helper is None:
+            return 127
+        rc = run_with_timeout(
+            config.probe_timeout, out, err, helper, "inspect",
+            spec.get("agent", ""), "--json", config=config,
+        )
+        if rc == 0:
+            observation = parse_agent_probe_output(out)
+            atomic_write(out, "%s %s" % (observation.token, observation.detail))
+        return rc
+    if kind == "globus":
+        helper = _probe_helper(kind, spec, err)
+        if helper is None:
+            return 127
+        rc = run_with_timeout(
+            config.probe_timeout, out, err, helper, "task", "show",
+            spec.get("task", ""), "-F", "json",
+            "--jq", "{status: .status, nice_status: .nice_status, faults: .faults, fatal_error: .fatal_error, effective_bytes_per_second: .effective_bytes_per_second}",
+            config=config,
+        )
+        if rc == 0:
+            observation = parse_globus_probe_output(out)
+            atomic_write(out, "%s %s" % (observation.token, observation.detail))
+        return rc
+    if kind == "git-ref":
+        rc = run_with_timeout(
+            config.probe_timeout, out, err, "git", "ls-remote",
+            spec.get("remote", ""), spec.get("ref", ""), config=config,
+        )
+        if rc == 0:
+            observation = parse_git_ref_probe_output(directory, out)
+            atomic_write(out, "%s %s" % (observation.token, observation.detail))
+        return rc
+    if kind == "pr-merge":
+        helper = _probe_helper(kind, spec, err)
+        if helper is None:
+            return 127
+        return run_with_timeout(
+            config.probe_timeout, out, err, helper, "pr", "view",
+            spec.get("pr", ""), "--repo", spec.get("repo", ""), "--json",
+            "state", "--jq", ".state", config=config,
+        )
     return 127
 
+
+KIND_FLOORS = {
+    "slurm": 120, "pbs": 120, "globus": 60, "agent": 60,
+    "git-ref": 60, "pr-merge": 60, "script": 60,
+}
+DEFAULT_TERMINAL = (
+    "COMPLETED,SUCCEEDED,FAILED,CANCELLED,TIMEOUT,ERROR,CLOSED,ARCHIVED,DONE"
+)
+
+
+def kind_floor(kind, host=""):
+    if kind == "file-exists":
+        return 120 if host else 60
+    return KIND_FLOORS.get(kind, 60)
+
+
+def kind_default_interval(kind, transitions=False, host=""):
+    if kind in ("slurm", "pbs"):
+        return 300 if transitions else 600
+    if kind == "file-exists":
+        return 120 if host else 60
+    return {
+        "globus": 300, "git-ref": 120, "pr-merge": 300,
+    }.get(kind, 60)
+
+
+def pm_kind_floor(kind, host=""):
+    return kind_floor(kind, host)
+
+
+def pm_kind_default_interval(kind, transitions=False, host=""):
+    return kind_default_interval(kind, transitions, host)
+
+
+def parse_deadline(value, now=None):
+    now = pm_now() if now is None else int(now)
+    text = str(value or "")
+    if text.startswith("+") and text[1:].isdigit():
+        return now + int(text[1:])
+    if text.startswith("now+") and text[4:].isdigit():
+        return now + int(text[4:])
+    if text.isdigit():
+        return int(text)
+    raise ValueError("deadline must be epoch seconds, +seconds, or now+seconds")
+
+
+def pm_parse_deadline(value, now=None):
+    return parse_deadline(value, now)
+
+
+def _truthy(value):
+    return str(value).lower() in ("1", "true", "yes")
+
+
+def prepare_registration(values, now=None):
+    """Validate and complete a registration spec before any state is written."""
+    spec = dict(values)
+    kind = spec.get("kind", "")
+    if kind not in set(KIND_FLOORS) | {"file-exists"}:
+        raise ValueError("unknown kind: %s" % kind)
+    if kind == "script":
+        if not spec.get("reason"):
+            raise ValueError("--reason is mandatory with --script")
+        if "terminal" not in spec or not spec.get("terminal"):
+            raise ValueError("--terminal is mandatory with --script")
+        source = Path(str(spec.get("script", "")))
+        if not source.is_file() or not os.access(str(source), os.X_OK):
+            raise ValueError("script must be an executable file: %s" % source)
+    required = {
+        "slurm": ("host", "job"), "pbs": ("host", "job"),
+        "globus": ("task",), "agent": ("agent",), "file-exists": ("path",),
+        "git-ref": ("remote", "ref"), "pr-merge": ("repo", "pr"),
+    }.get(kind, ())
+    for key in required:
+        if not spec.get(key):
+            raise ValueError("%s needs %s" % (kind, " and ".join(required)))
+    if kind == "script":
+        spec["script"] = str(Path(str(spec["script"])).resolve())
+    if kind == "agent":
+        spec.setdefault("report_on", "BLOCKED-PERMISSION,CLOSED,ARCHIVED")
+        spec.setdefault("dwell", "2")
+        spec["report_transitions"] = "1"
+    if kind == "pr-merge":
+        terminal = [x for x in str(spec.get("terminal", DEFAULT_TERMINAL)).split(",") if x]
+        for token in ("MERGED", "CLOSED"):
+            if token not in terminal:
+                terminal.append(token)
+        spec["terminal"] = ",".join(terminal)
+    elif kind == "file-exists":
+        terminal = [x for x in str(spec.get("terminal", DEFAULT_TERMINAL)).split(",") if x]
+        if "EXISTS" not in terminal:
+            terminal.append("EXISTS")
+        spec["terminal"] = ",".join(terminal)
+    elif kind == "pbs":
+        terminal = [x for x in str(spec.get("terminal", DEFAULT_TERMINAL)).split(",") if x]
+        for token in ("C", "F"):
+            if token not in terminal:
+                terminal.append(token)
+        spec["terminal"] = ",".join(terminal)
+    else:
+        spec.setdefault("terminal", DEFAULT_TERMINAL)
+    transitions = _truthy(spec.get("report_transitions", False)) or bool(spec.get("report_on"))
+    if ":" in str(spec.get("report_on", "")):
+        spec["with_reason"] = "1"
+    spec.setdefault("with_reason", "0")
+    interval = spec.get("interval")
+    interval = kind_default_interval(kind, transitions, spec.get("host", "")) if interval in (None, "") else _uint(interval, -1)
+    if interval < 0 or str(interval) != str(spec.get("interval", interval)) and spec.get("interval") not in (None, ""):
+        raise ValueError("interval must be an integer")
+    if interval < kind_floor(kind, spec.get("host", "")):
+        raise ValueError(
+            "interval %s is below %s floor %s" % (interval, kind, kind_floor(kind, spec.get("host", "")))
+        )
+    spec["interval"] = str(interval)
+    spec["deadline"] = str(parse_deadline(spec.get("deadline"), now))
+    if int(spec["deadline"]) <= int(now):
+        raise ValueError("deadline must be in the future")
+    for key, default in (("dwell", "0"), ("max_fires", "0"), ("max_runs", "1")):
+        if key not in spec or spec[key] in (None, ""):
+            spec[key] = default
+        if not pm_valid_uint(spec[key]):
+            raise ValueError("%s must be an integer" % key.replace("_", "-"))
+    if int(spec["max_runs"]) <= 0:
+        raise ValueError("max-runs must be greater than zero")
+    return spec
+
+
+def register_watch(values, config=CONFIG, now=None, watch_id=None):
+    """Create a durable watch only after its synchronous first probe succeeds."""
+    now = pm_now() if now is None else int(now)
+    spec = prepare_registration(values, now)
+    ensure_dirs(config.home)
+    watch_id = watch_id or str(uuid.uuid4())
+    directory = Path(config.home) / "watches" / watch_id
+    directory.mkdir(parents=False)
+    try:
+        kind = spec["kind"]
+        if kind in ("agent", "globus", "pr-merge"):
+            try:
+                spec["helper"] = resolve_binary(spec.get("helper") or {
+                    "agent": "paseo", "globus": "globus", "pr-merge": "gh"
+                }[kind])
+            except FileNotFoundError as exc:
+                raise ValueError("required helper not found: %s" % (spec.get("helper") or {
+                    "agent": "paseo", "globus": "globus", "pr-merge": "gh"
+                }[kind])) from exc
+        spec.setdefault("state", "active")
+        spec.setdefault("registered", str(now))
+        spec.setdefault("owner", "")
+        spec.setdefault("report_to", "")
+        write_spec(directory / "spec", spec)
+        if kind == "script":
+            target = directory / "probe"
+            shutil.copyfile(spec["script"], str(target))
+            target.chmod(0o700)
+        atomic_write(directory / "context", spec.get("context", ""))
+        atomic_write(directory / "fires", "0")
+        atomic_write(directory / "health", "0 none")
+        atomic_write(directory / "state", "active")
+        out, err = directory / ".register.stdout", directory / ".register.stderr"
+        rc = _spec_probe(directory, spec, out, err, config)
+        if rc:
+            message = err.read_text(encoding="utf-8", errors="replace") if err.is_file() else ""
+            raise RuntimeError("registration probe failed (health rc=%s)%s" % (
+                rc, ": %s" % message.strip() if message.strip() else ""
+            ))
+        observation = parse_probe_output(out)
+        atomic_write(directory / "last", observation.token)
+        atomic_write(directory / "detail", observation.detail)
+        atomic_write(directory / "nextDue", next_due(now, int(spec["interval"]), watch_id, config))
+        if observation.token in _terminal_tokens(spec):
+            set_state(directory, "terminal")
+        log_line(directory, "REGISTER", "token=%s" % observation.token,
+                 "detail=%s" % observation.detail, config=config)
+        return watch_id, observation
+    except Exception:
+        shutil.rmtree(str(directory), ignore_errors=True)
+        raise
+    finally:
+        for path in (directory / ".register.stdout", directory / ".register.stderr"):
+            try:
+                path.unlink()
+            except FileNotFoundError:
+                pass
+
+
+def pm_register_watch(values, config=CONFIG, now=None, watch_id=None):
+    return register_watch(values, config=config, now=now, watch_id=watch_id)
+
 def run_registered_probe(directory, stdout_path, stderr_path, config=CONFIG):
-    spec = read_spec(Path(directory) / "spec")
-    return _spec_probe(Path(directory), spec, Path(stdout_path), Path(stderr_path), config)
+    directory = Path(directory)
+    spec = read_spec(directory / "spec")
+    kind = spec.get("kind", "")
+    if kind in ("agent", "globus", "pr-merge") and not spec.get("helper"):
+        try:
+            helper = _helper_for_kind(kind, spec)
+        except FileNotFoundError:
+            return 127
+        update_spec(directory / "spec", "helper", helper)
+        spec["helper"] = helper
+    return _spec_probe(directory, spec, Path(stdout_path), Path(stderr_path), config)
 
 
 def pm_run_registered_probe(directory, stdout_path, stderr_path, config=CONFIG):
@@ -691,56 +1126,147 @@ def event_class(old, new, terminal_tokens):
     return "terminal" if new in terminal_tokens else "transition"
 
 
+def _agent_dwell_accept(directory, spec, token):
+    """Apply dwell only to agent RUNNING/IDLE observations."""
+    if spec.get("kind") != "agent" or token not in ("IDLE", "RUNNING"):
+        try:
+            (Path(directory) / "dwell").unlink()
+        except FileNotFoundError:
+            pass
+        return True
+    dwell = _uint(spec.get("dwell", "0"), 0)
+    if dwell <= 1:
+        try:
+            (Path(directory) / "dwell").unlink()
+        except FileNotFoundError:
+            pass
+        return True
+    directory = Path(directory)
+    old = (directory / "last").read_text().strip() if (directory / "last").is_file() else ""
+    if token == old:
+        try:
+            (directory / "dwell").unlink()
+        except FileNotFoundError:
+            pass
+        return True
+    saved = (directory / "dwell").read_text().strip().split() if (directory / "dwell").is_file() else []
+    count = _uint(saved[1], 0) + 1 if len(saved) == 2 and saved[0] == token else 1
+    if count < dwell:
+        atomic_write(directory / "dwell", "%s %s" % (token, count))
+        log_line(directory, "DWELL", token, "count=%s/%s" % (count, dwell))
+        return False
+    try:
+        (directory / "dwell").unlink()
+    except FileNotFoundError:
+        pass
+    return True
+
+
+def _report_requested(spec, classification, token, old):
+    if classification == "terminal":
+        return True
+    if token == "UNKNOWN" and old != "UNKNOWN":
+        return True
+    requested = set(x for x in spec.get("report_on", "").split(",") if x)
+    return token in requested or _truthy(spec.get("report_transitions", False))
+
+
+def _report_transition(directory, spec, classification, old, observation, config):
+    if not _report_requested(spec, classification, observation.token, old):
+        return
+    limit = _uint(spec.get("max_fires", "0"), 0)
+    fires_path = Path(directory) / "fires"
+    fires = _uint(fires_path.read_text().strip(), 0) if fires_path.is_file() else 0
+    exhausted_path = Path(directory) / "exhausted"
+    if limit and fires >= limit:
+        if not exhausted_path.is_file():
+            log_line(directory, "REPORT", "class=exhausted", "old=%s" % old,
+                     "new=MAX-FIRES-REACHED", config=config)
+            atomic_write(exhausted_path, "1")
+        log_line(directory, "SUPPRESSED", classification, "old=%s" % old,
+                 "new=%s" % observation.token, config=config)
+        return
+    atomic_write(fires_path, str(fires + 1))
+    log_line(directory, "REPORT", "class=%s" % classification,
+             "old=%s" % old, "new=%s" % observation.token,
+             observation.detail, config=config)
+
+
 def _sweep_watch(directory, config=CONFIG):
     directory = Path(directory)
     spec_path = directory / "spec"
     if not spec_path.is_file() or (directory / "graveyard").is_file():
         return False
     spec = read_spec(spec_path)
-    state = (directory / "state").read_text(encoding="utf-8").strip() if (directory / "state").is_file() else "active"
+    state = (directory / "state").read_text(
+        encoding="utf-8"
+    ).strip() if (directory / "state").is_file() else "active"
     if state in ("terminal", "expired", "parked"):
         return False
     now = pm_now()
     deadline = _uint(spec.get("deadline", ""), 0)
     if deadline and now >= deadline:
-        old = (directory / "last").read_text(encoding="utf-8").strip() if (directory / "last").is_file() else ""
+        old = (directory / "last").read_text().strip() if (directory / "last").is_file() else ""
         log_line(directory, "DEADLINE", "last=%s" % old, config=config)
+        log_line(directory, "REPORT", "class=deadline", "old=%s" % old,
+                 "new=DEADLINE", config=config)
         set_state(directory, "expired")
         return True
-    due = _uint((directory / "nextDue").read_text().strip() if (directory / "nextDue").is_file() else "0", 0)
+    due = _uint(
+        (directory / "nextDue").read_text().strip()
+        if (directory / "nextDue").is_file() else "0", 0
+    )
     if now < due:
         return False
-    out, err = directory / (".probe.stdout.%s" % os.getpid()), directory / (".probe.stderr.%s" % os.getpid())
+    out = directory / (".probe.stdout.%s" % os.getpid())
+    err = directory / (".probe.stderr.%s" % os.getpid())
     try:
         rc = _spec_probe(directory, spec, out, err, config)
-        stderr = err.read_text(encoding="utf-8", errors="replace") if err.is_file() else ""
+        stderr = err.read_text(
+            encoding="utf-8", errors="replace"
+        ) if err.is_file() else ""
         if rc:
             health_path = directory / "health"
             current = health_path.read_text().strip().split() if health_path.is_file() else ["0", "none"]
             count = _uint(current[0] if current else "0", 0) + 1
             classification = health_failure_class(rc, stderr)
             atomic_write(health_path, "%s %s" % (count, classification))
-            log_line(directory, "PROBE-FAIL", "class=%s" % classification, "count=%s" % count, "rc=%s" % rc, config=config)
+            log_line(directory, "PROBE-FAIL", "class=%s" % classification,
+                     "count=%s" % count, "rc=%s" % rc, config=config)
             delay = _uint(spec.get("interval", "60"), 60) * min(count + 1, 8) * config.backoff_scale
             atomic_write(directory / "nextDue", now + delay)
             return True
         observation = parse_probe_output(out)
-        old = (directory / "last").read_text(encoding="utf-8").strip() if (directory / "last").is_file() else ""
+        old = (directory / "last").read_text().strip() if (directory / "last").is_file() else ""
+        if not _agent_dwell_accept(directory, spec, observation.token):
+            atomic_write(directory / "health", "0 healthy")
+            interval = _uint(spec.get("interval", "60"), 60)
+            atomic_write(directory / "nextDue", next_due(pm_now(), interval, directory.name, config))
+            return True
         atomic_write(directory / "health", "0 healthy")
         atomic_write(directory / "last", observation.token)
         atomic_write(directory / "detail", observation.detail)
         classification = event_class(old, observation.token, _terminal_tokens(spec))
         if classification:
-            log_line(directory, "TOKEN-CHANGE", "%s -> %s" % (old, observation.token), observation.detail, config=config)
-            log_line(directory, "EVENT", "class=%s" % classification, "old=%s" % old, "new=%s" % observation.token, config=config)
+            log_line(directory, "TOKEN-CHANGE",
+                     "%s -> %s" % (old, observation.token),
+                     observation.detail, config=config)
+            log_line(directory, "EVENT", "class=%s" % classification,
+                     "old=%s" % old, "new=%s" % observation.token,
+                     config=config)
+            _report_transition(directory, spec, classification, old, observation, config)
             if classification == "terminal":
                 set_state(directory, "terminal")
         interval = _uint(spec.get("interval", "60"), 60)
-        atomic_write(directory / "nextDue", next_due(pm_now(), interval, directory.name, config))
+        atomic_write(directory / "nextDue", next_due(now, interval, directory.name, config))
         return True
     except (OSError, ValueError) as exc:
-        log_line(directory, "PROBE-FAIL", "class=protocol", "detail=%s" % exc, config=config)
-        atomic_write(directory / "nextDue", next_due(pm_now(), _uint(spec.get("interval", "60"), 60), directory.name, config))
+        log_line(directory, "PROBE-FAIL", "class=protocol",
+                 "detail=%s" % exc, config=config)
+        atomic_write(
+            directory / "nextDue",
+            next_due(now, _uint(spec.get("interval", "60"), 60), directory.name, config),
+        )
         return True
     finally:
         for path in (out, err):

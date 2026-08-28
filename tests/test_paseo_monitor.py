@@ -195,8 +195,257 @@ class FoundationTests(unittest.TestCase):
         self.assertFalse(result.skipped)
         self.assertEqual((watch / "last").read_text().strip(), "RUNNING")
         self.assertEqual((watch / "detail").read_text().strip(), "detail")
-        self.assertEqual((watch / "nextDue").read_text().strip(), str(int(time.time())))
+        scheduled = int((watch / "nextDue").read_text().strip())
+        self.assertLessEqual(abs(scheduled - int(time.time())), 1)
         (watch / "nextDue").write_text(str(int(time.time()) + 600) + os.linesep)
         before = (watch / "log").read_text()
         PM.sweep(sweep_config)
         self.assertEqual((watch / "log").read_text(), before)
+
+
+class ProbeKindTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.root = Path(self.temp.name) / "home"
+        self.bin = Path(self.temp.name) / "bin"
+        self.bin.mkdir()
+        self.calls = Path(self.temp.name) / "calls"
+        self.response = Path(self.temp.name) / "response"
+        self.config = PM.Config(
+            home=self.root, log_max_bytes=10000, lock_grace_seconds=0,
+            backoff_scale=0, fast_sweep=True, probe_timeout=1,
+        )
+        self.old_env = dict(os.environ)
+        os.environ["PATH"] = str(self.bin) + os.pathsep + self.old_env.get("PATH", "")
+        os.environ["MOCK_CALLS"] = str(self.calls)
+        os.environ["MOCK_RESPONSE"] = str(self.response)
+        os.environ["MOCK_RC"] = "0"
+
+    def tearDown(self):
+        os.environ.clear()
+        os.environ.update(self.old_env)
+        self.temp.cleanup()
+
+    def mock(self, name, body):
+        path = self.bin / name
+        path.write_text("#!/bin/sh\n" + body + "\n")
+        path.chmod(path.stat().st_mode | stat.S_IXUSR)
+        return path
+
+    def remote_mock(self):
+        return self.mock(
+            "ssh",
+            "printf '%s\\n' \"$*\" >> \"$MOCK_CALLS\"\n"
+            "cat \"$MOCK_RESPONSE\"\n"
+            "exit \"${MOCK_RC:-0}\"",
+        )
+
+    def register(self, values):
+        values = dict(values)
+        values.setdefault("deadline", str(int(time.time()) + 300))
+        return PM.register_watch(values, config=self.config, now=int(time.time()))
+
+    def due(self, watch_id):
+        path = self.root / "watches" / watch_id / "nextDue"
+        path.write_text("0\n")
+
+    def test_slurm_accounting_lag_terminals_unknown_and_reason_discipline(self):
+        self.remote_mock()
+        self.response.write_text("")
+        watch_id, observation = self.register({
+            "kind": "slurm", "host": "cannon", "job": "lag",
+        })
+        self.assertEqual(observation.token, "PENDING")
+        self.assertIn("sacct -X -j lag", self.calls.read_text())
+        self.assertNotIn("squeue", self.calls.read_text())
+
+        self.response.write_text("CANCELLED by 12345\n")
+        self.due(watch_id)
+        PM.pm_sweep_watch(self.root / "watches" / watch_id, self.config)
+        self.assertEqual(
+            (self.root / "watches" / watch_id / "last").read_text().strip(),
+            "CANCELLED",
+        )
+
+        self.response.write_text("RUNNING\n")
+        timeout_id, _ = self.register({
+            "kind": "slurm", "host": "cannon", "job": "timeout",
+        })
+        self.response.write_text("TIMEOUT\n")
+        self.due(timeout_id)
+        PM.pm_sweep_watch(self.root / "watches" / timeout_id, self.config)
+        timeout_dir = self.root / "watches" / timeout_id
+        self.assertEqual((timeout_dir / "last").read_text().strip(), "TIMEOUT")
+        self.assertEqual((timeout_dir / "state").read_text().strip(), "terminal")
+
+        self.response.write_text("RUNNING\n")
+        unknown_id, _ = self.register({
+            "kind": "slurm", "host": "cannon", "job": "unknown",
+        })
+        self.response.write_text("UNKNOWN\n")
+        self.due(unknown_id)
+        PM.pm_sweep_watch(self.root / "watches" / unknown_id, self.config)
+        self.due(unknown_id)
+        PM.pm_sweep_watch(self.root / "watches" / unknown_id, self.config)
+        unknown_log = (self.root / "watches" / unknown_id / "log").read_text()
+        self.assertEqual(unknown_log.count(" REPORT "), 1)
+        self.assertEqual(
+            (self.root / "watches" / unknown_id / "health").read_text().strip(),
+            "0 healthy",
+        )
+
+        self.response.write_text("RUNNING\n")
+        off_id, _ = self.register({
+            "kind": "slurm", "host": "cannon", "job": "reason-off",
+        })
+        self.calls.write_text("")
+        self.response.write_text("")
+        self.due(off_id)
+        PM.pm_sweep_watch(self.root / "watches" / off_id, self.config)
+        off_dir = self.root / "watches" / off_id
+        self.assertEqual((off_dir / "last").read_text().strip(), "PENDING")
+        self.assertNotIn("squeue", self.calls.read_text())
+
+        self.calls.write_text("")
+        self.response.write_text("PENDING\nPASEO_MONITOR_SQUEUE\nPENDING|Priority\n")
+        reason_id, observation = self.register({
+            "kind": "slurm", "host": "cannon", "job": "reason",
+            "with_reason": "1",
+        })
+        self.assertEqual(observation.token, "PENDING:Priority")
+        call_text = self.calls.read_text()
+        self.assertEqual(call_text.count("BatchMode=yes"), 1)
+        self.assertIn("sacct -X -j reason", call_text)
+        self.assertIn("squeue -h -j reason", call_text)
+        self.response.write_text("\nPASEO_MONITOR_SQUEUE\n")
+        self.due(reason_id)
+        PM.pm_sweep_watch(self.root / "watches" / reason_id, self.config)
+        self.assertEqual(
+            (self.root / "watches" / reason_id / "last").read_text().strip(),
+            "VANISHED",
+        )
+
+    def test_pbs_fallback_is_single_remote_call_and_isolated_from_slurm(self):
+        self.remote_mock()
+        self.response.write_text(
+            "PASEO_MONITOR_PBS_HISTORICAL\nJob Id: 1.server\n    job_state = F\n"
+        )
+        watch_id, observation = self.register({
+            "kind": "pbs", "host": "polaris", "job": "1.server",
+        })
+        self.assertEqual(observation.token, "F")
+        call = self.calls.read_text()
+        self.assertEqual(call.count("BatchMode=yes"), 1)
+        self.assertIn("qstat -f", call)
+        self.assertIn("qstat -x", call)
+        self.assertNotIn("sacct", call)
+        self.assertNotIn("squeue", call)
+        self.response.write_text("COMPLETED\n")
+        out = self.root / "standalone"
+        out.write_text("COMPLETED\n")
+        PM.parse_slurm_probe_output(self.root, out)
+        self.assertEqual(PM.parse_probe_output(out).token, "COMPLETED")
+        self.assertTrue(watch_id)
+
+    def test_agent_dwell_is_per_kind_and_idle_facts_are_verbatim(self):
+        self.mock("paseo", "cat \"$MOCK_RESPONSE\"")
+        self.response.write_text(
+            '{"Status":"running","Archived":false,"PendingPermissions":[],'
+            '"UpdatedAt":"2026-08-27T01:02:03Z"}'
+        )
+        watch_id, _ = self.register({"kind": "agent", "agent": "a1"})
+        directory = self.root / "watches" / watch_id
+        self.assertIn("dwell=2", (directory / "spec").read_text())
+        self.response.write_text(
+            '{"Status":"idle","Archived":false,"PendingPermissions":[],'
+            '"UpdatedAt":"2026-08-27T01:05:06Z"}'
+        )
+        self.due(watch_id)
+        PM.pm_sweep_watch(directory, self.config)
+        self.assertEqual((directory / "last").read_text().strip(), "RUNNING")
+        self.response.write_text(
+            '{"Status":"running","Archived":false,"PendingPermissions":[],'
+            '"UpdatedAt":"2026-08-27T01:04:05Z"}'
+        )
+        self.due(watch_id)
+        PM.pm_sweep_watch(directory, self.config)
+        self.assertEqual((directory / "last").read_text().strip(), "RUNNING")
+        self.response.write_text(
+            '{"Status":"idle","Archived":false,"PendingPermissions":[],'
+            '"UpdatedAt":"2026-08-27T01:05:06Z"}'
+        )
+        self.due(watch_id)
+        PM.pm_sweep_watch(directory, self.config)
+        self.due(watch_id)
+        PM.pm_sweep_watch(directory, self.config)
+        self.assertEqual((directory / "last").read_text().strip(), "IDLE")
+        log = (directory / "log").read_text()
+        self.assertIn("went idle", log)
+        self.assertIn("updated_at=2026-08-27T01:05:06Z", log)
+        self.assertIn("idle_since=2026-08-27T01:05:06Z", log)
+
+    def test_globus_git_ref_pr_merge_and_script_dispatch(self):
+        self.mock("globus", "cat \"$MOCK_RESPONSE\"")
+        self.response.write_text(
+            '{"status":"ACTIVE","nice_status":"Transferring","faults":["NONE"],'
+            '"fatal_error":null,"effective_bytes_per_second":12.5}'
+        )
+        globus_id, observation = self.register({"kind": "globus", "task": "T1"})
+        self.assertEqual(observation.token, "ACTIVE")
+        self.assertIn("effective_bytes_per_second=12.5",
+                      (self.root / "watches" / globus_id / "detail").read_text())
+
+        self.mock("git", "cat \"$MOCK_RESPONSE\"")
+        self.response.write_text("a" * 40 + "\trefs/heads/main\n")
+        git_id, observation = self.register({
+            "kind": "git-ref", "remote": "https://example.invalid/r.git",
+            "ref": "refs/heads/main", "report_transitions": "1",
+        })
+        self.assertEqual(observation.token, "a" * 40)
+        self.response.write_text("b" * 40 + "\trefs/heads/main\n")
+        self.due(git_id)
+        PM.pm_sweep_watch(self.root / "watches" / git_id, self.config)
+        self.assertIn("old=%s new=%s" % ("a" * 40, "b" * 40),
+                      (self.root / "watches" / git_id / "detail").read_text())
+
+        self.mock("gh", "printf 'MERGED\\n'")
+        pr_id, observation = self.register({
+            "kind": "pr-merge", "repo": "o/r", "pr": "7",
+        })
+        self.assertEqual(observation.token, "MERGED")
+        self.assertEqual(
+            (self.root / "watches" / pr_id / "state").read_text().strip(),
+            "terminal",
+        )
+
+        script = self.temp.name + "/source"
+        Path(script).write_text("#!/bin/sh\nprintf 'DONE snapshotted\\n'\n")
+        Path(script).chmod(0o700)
+        script_id, observation = self.register({
+            "kind": "script", "script": script, "reason": "test",
+            "terminal": "DONE",
+        })
+        self.assertEqual(observation.token, "DONE")
+        Path(script).unlink()
+        self.assertTrue((self.root / "watches" / script_id / "probe").is_file())
+
+    def test_registration_floors_helpers_and_remote_rc_127(self):
+        self.remote_mock()
+        self.response.write_text("RUNNING\n")
+        with self.assertRaises(ValueError):
+            self.register({
+                "kind": "slurm", "host": "cannon", "job": "1",
+                "interval": "119",
+            })
+        with self.assertRaises(ValueError):
+            self.register({
+                "kind": "script", "script": "/missing", "reason": "x",
+            })
+        old_path = os.environ["PATH"]
+        os.environ["PATH"] = str(self.bin / "missing")
+        out, err = self.root / "out", self.root / "err"
+        rc = PM.run_remote_probe(out, err, "cannon", "ls", "-d", "/x",
+                                 config=self.config)
+        self.assertEqual(rc, 127)
+        self.assertEqual(PM.health_failure_class(rc, err.read_text()), "config")
+        os.environ["PATH"] = old_path
