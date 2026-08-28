@@ -3,5 +3,6 @@ script-reason-mandatory	rc=2	paseo-monitor: --reason is mandatory with --script
 script-terminal-mandatory	rc=2	paseo-monitor: --terminal is mandatory with --script
 slurm-cadence-floor	rc=2	paseo-monitor: interval 119 is below slurm floor 120
 registration-probe-failure	rc=1	broken probe detail paseo-monitor: registration probe failed (health rc=9)
+sandbox-registration	rc=0	sandbox-class ssh-rc=255 Control socket connect(/x): Operation not permitted ssh: Could not resolve hostname h: -65563 paseo-monitor: WARN registration probe unavailable in caller sandbox; sweeper will make the first observation
 required-paseo-helper	rc=2	paseo-monitor: required helper not found: paseo
 watch-not-found	rc=1	paseo-monitor: watch not found: DOES-NOT-EXIST

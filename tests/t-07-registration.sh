@@ -35,6 +35,29 @@ chmod +x "$SANDBOX/broken"
 if $PMT_BIN watch --script "$SANDBOX/broken" --reason 'broken test' --terminal DONE --deadline +300; then
     fail "broken registration succeeded"
 fi
+
+tab="$(printf '\t')"
+mock_ssh_script "255${tab}${tab}Control socket connect(/x): Operation not permitted\\nssh: Could not resolve hostname h: -65563"
+sandbox_stderr="$SANDBOX/sandbox.err"
+sandbox_output="$($PMT_BIN watch --kind slurm --host cannon --job sandbox --deadline +300 --no-start-report 2>"$sandbox_stderr")" || fail "sandbox registration failed"
+sandbox_id=$(printf '%s\n' "$sandbox_output" | sed -n 's/^watch \([^ ]*\) registered.*/\1/p')
+[ -n "$sandbox_id" ] || fail "sandbox watch id missing"
+sandbox_dir="$PM_HOME/watches/$sandbox_id"
+[ -d "$sandbox_dir" ] || fail "sandbox watch was not created"
+assert_eq "$(cat "$sandbox_dir/state")" active "sandbox watch state"
+assert_grep "$sandbox_stderr" 'WARN registration probe unavailable in caller sandbox' "sandbox registration warning"
+for sandbox_sweep in 1 2 3; do
+    printf '0\n' > "$sandbox_dir/nextDue"
+    mock_ssh_script "255${tab}${tab}Control socket connect(/x): Operation not permitted\\nssh: Could not resolve hostname h: -65563"
+    $PMT_BIN _sweep || fail "sandbox failure sweep $sandbox_sweep failed"
+done
+assert_eq "$(cat "$sandbox_dir/state")" active "sandbox watch not parked"
+assert_eq "$(cat "$sandbox_dir/health")" "3 sandbox" "sandbox health class"
+
+mock_ssh_script "0${tab}RUNNING"
+$PMT_BIN _sweep || fail "sandbox watch sweep failed"
+assert_eq "$(cat "$sandbox_dir/last")" RUNNING "sweeper first observation"
+
 watch_count=$(for d in "$PM_HOME"/watches/*; do [ -d "$d" ] && printf x; done | wc -c | tr -d ' ')
 if $PMT_BIN watch --script "$SANDBOX/broken" --reason 'floor test' --terminal DONE --interval 59 --deadline +300; then
     fail "script cadence floor accepted"

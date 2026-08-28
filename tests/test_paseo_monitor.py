@@ -152,6 +152,29 @@ class FoundationTests(unittest.TestCase):
             self.assertIn("auth-class ssh-rc=255", err.read_text())
             call = Path(os.environ["MOCK_CALLS"]).read_text()
             self.assertIn("-o BatchMode=yes -o ConnectTimeout=15 cannon ls -d /scratch/result", call)
+            ssh.write_text(
+                "#!/bin/sh\n"
+                "printf '%s\\n' 'Control socket connect(/x): Operation not permitted' "
+                "'ssh: Could not resolve hostname h: -65563' >&2\n"
+                "exit 255\n"
+            )
+            ssh.chmod(ssh.stat().st_mode | stat.S_IXUSR)
+            sandbox_rc = PM.run_remote_probe(out, err, "cannon", "ls", "-d", "/scratch/result",
+                                             config=self.config)
+            self.assertEqual(sandbox_rc, 255)
+            self.assertEqual(PM.health_failure_class(sandbox_rc, err.read_text()), "sandbox")
+            self.assertIn("sandbox-class ssh-rc=255", err.read_text())
+            self.assertEqual(PM.health_failure_class(255, "Permission denied (publickey)"), "auth")
+            self.assertEqual(PM.health_failure_class(255, "Connection timed out"), "network")
+            self.assertEqual(PM.health_failure_class(255, "Operation not permitted"), "network")
+            self.assertEqual(PM.health_failure_class(1, "[Errno 1] Operation not permitted"), "sandbox")
+
+            ssh.write_text(
+                "#!/bin/sh\n"
+                "printf '%s\\n' \"$*\" >> \"$MOCK_CALLS\"; cat \"$MOCK_RESPONSE\" >&2; "
+                "exit \"$MOCK_RC\"\n"
+            )
+            ssh.chmod(ssh.stat().st_mode | stat.S_IXUSR)
             os.environ["MOCK_RC"] = "0"
             Path(os.environ["MOCK_RESPONSE"]).write_text("/scratch/result" + os.linesep)
             remote = self.root / "remote"
@@ -435,6 +458,54 @@ class ProbeKindTests(unittest.TestCase):
         self.assertEqual(observation.token, "DONE")
         Path(script).unlink()
         self.assertTrue((self.root / "watches" / script_id / "probe").is_file())
+
+    def test_sandbox_registration_defers_first_observation_to_sweeper(self):
+        self.mock(
+            "ssh",
+            "printf '%s\\n' 'Control socket connect(/x): Operation not permitted' "
+            "'ssh: Could not resolve hostname h: -65563' >&2\nexit 255",
+        )
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr):
+            watch_id, observation = self.register({
+                "kind": "slurm", "host": "cannon", "job": "sandbox",
+            })
+        directory = self.root / "watches" / watch_id
+        self.assertEqual(observation.token, "UNOBSERVED")
+        self.assertEqual((directory / "state").read_text().strip(), "active")
+        self.assertFalse((directory / "last").exists())
+        self.assertIn(
+            "WARN registration probe unavailable in caller sandbox; "
+            "sweeper will make the first observation",
+            stderr.getvalue(),
+        )
+        for _ in range(3):
+            self.mock(
+                "ssh",
+                "printf '%s\\n' 'Control socket connect(/x): Operation not permitted' "
+                "'ssh: Could not resolve hostname h: -65563' >&2\nexit 255",
+            )
+            self.due(watch_id)
+            PM.pm_sweep_watch(directory, self.config)
+        self.assertEqual((directory / "state").read_text().strip(), "active")
+        self.assertEqual((directory / "health").read_text().strip(), "3 sandbox")
+
+        self.remote_mock()
+        self.response.write_text("RUNNING\n")
+        self.due(watch_id)
+        PM.pm_sweep_watch(directory, self.config)
+        self.assertEqual((directory / "last").read_text().strip(), "RUNNING")
+
+    def test_broken_script_probe_still_rejects_registration(self):
+        broken = Path(self.temp.name) / "broken"
+        broken.write_text("#!/bin/sh\nprintf 'broken probe detail\\n' >&2\nexit 9\n")
+        broken.chmod(broken.stat().st_mode | stat.S_IXUSR)
+        with self.assertRaises(RuntimeError):
+            self.register({
+                "kind": "script", "script": str(broken), "reason": "broken",
+                "terminal": "DONE",
+            })
+        self.assertEqual(list((self.root / "watches").glob("*")), [])
 
     def test_registration_floors_helpers_and_remote_rc_127(self):
         self.remote_mock()

@@ -105,6 +105,19 @@ record_error script-reason-mandatory watch --script "$SANDBOX/probe" --terminal 
 record_error script-terminal-mandatory watch --script "$SANDBOX/probe" --reason reason --deadline +300
 record_error slurm-cadence-floor watch --kind slurm --host cannon --job 42 --interval 119 --deadline +300
 record_error registration-probe-failure watch --script "$SANDBOX/broken" --reason broken --terminal DONE --deadline +300
+mkdir -p "$SANDBOX/sandbox-bin"
+cat > "$SANDBOX/sandbox-bin/ssh" <<'EOF'
+#!/bin/sh
+printf '%s\n' 'Control socket connect(/x): Operation not permitted' 'ssh: Could not resolve hostname h: -65563' >&2
+exit 255
+EOF
+chmod +x "$SANDBOX/sandbox-bin/ssh"
+old_path="$PATH"
+PATH="$SANDBOX/sandbox-bin:$PATH"
+export PATH
+record_error sandbox-registration watch --kind slurm --host cannon --job sandbox --deadline +300 --no-start-report
+PATH="$old_path"
+export PATH
 old_path="$PATH"
 PATH="$SANDBOX/empty:${PMT_PYTHON_DIR:+$PMT_PYTHON_DIR:}/usr/bin:/bin:/usr/sbin:/sbin"
 export PATH

@@ -553,14 +553,7 @@ pm_run_remote_probe() {
     prr_rc=$?
     if [ "$prr_rc" -eq 255 ]; then
         prr_err_text="$(cat "$prr_err" 2>/dev/null || printf '')"
-        case "$prr_err_text" in
-            *[Aa]uthentication*|*[Pp]ermission\ denied*|*[Pp]assphrase*|*[Pp]assword*|*[Vv]erification*|*[Mm][Ff][Aa]*|*keyboard-interactive*)
-                prr_class=auth
-                ;;
-            *)
-                prr_class=network
-                ;;
-        esac
+        prr_class="$(pm_health_failure_class "$prr_rc" "$prr_err_text")"
         {
             printf '%s-class ssh-rc=255\n' "$prr_class"
             [ -n "$prr_err_text" ] && printf '%s\n' "$prr_err_text"
@@ -1219,6 +1212,19 @@ pm_should_report_transition() {
     pm_match_csv "$psr_token" "$psr_report_on"
 }
 
+pm_is_sandbox_error() {
+    pse_text="$1"
+    case "$pse_text" in
+        *-65563*) return 0 ;;
+        *[Oo]peration\ not\ permitted*)
+            case "$pse_text" in
+                *[Cc]ontrol\ socket*|*\[Errno\ 1\]*) return 0 ;;
+            esac
+            ;;
+    esac
+    return 1
+}
+
 pm_health_failure_class() {
     phf_rc="$1"
     phf_err="$2"
@@ -1229,6 +1235,10 @@ pm_health_failure_class() {
         printf 'config'
         return 0
     }
+    if pm_is_sandbox_error "$phf_err"; then
+        printf 'sandbox'
+        return 0
+    fi
     if [ "$phf_rc" -eq 255 ]; then
         case "$phf_err" in
             *[Aa]uthentication*|*[Pp]ermission*|*AUTH*|*auth*|*assword*|*passphrase*|*verification*)
@@ -1683,18 +1693,34 @@ labels=$pwm_labels"
     pm_atomic_write "$pwm_dir/state" active || { rm -rf "$pwm_dir"; return 1; }
     pwm_out="$pwm_dir/.register.stdout"
     pwm_err="$pwm_dir/.register.stderr"
+    pwm_sandbox=0
     pm_run_registered_probe "$pwm_dir" "$pwm_out" "$pwm_err"
     pwm_rc=$?
     if [ "$pwm_rc" -ne 0 ] || ! pm_parse_probe_output "$pwm_out"; then
-        [ -s "$pwm_err" ] && cat "$pwm_err" >&2
-        echo "paseo-monitor: registration probe failed (health rc=$pwm_rc)" >&2
-        rm -rf "$pwm_dir"
-        return 1
+        pwm_err_text="$(cat "$pwm_err" 2>/dev/null || printf '')"
+        pwm_class="$(pm_health_failure_class "$pwm_rc" "$pwm_err_text")"
+        # Built-in probes may be retried by the unsandboxed sweeper; a script
+        # failure belongs to the watch specification and still aborts.
+        if [ "$pwm_class" = sandbox ] && [ "$pwm_kind" != script ]; then
+            [ -n "$pwm_err_text" ] && printf '%s\n' "$pwm_err_text" >&2
+            printf 'paseo-monitor: WARN registration probe unavailable in caller sandbox; sweeper will make the first observation\n' >&2
+            pwm_sandbox=1
+            PM_PARSED_TOKEN=UNOBSERVED
+            PM_PARSED_DETAIL="registration probe unavailable in caller sandbox; sweeper will make the first observation"
+            pm_atomic_write "$pwm_dir/nextDue" "$pwm_now" || { rm -rf "$pwm_dir"; return 1; }
+        else
+            [ -n "$pwm_err_text" ] && printf '%s\n' "$pwm_err_text" >&2
+            echo "paseo-monitor: registration probe failed (health rc=$pwm_rc)" >&2
+            rm -rf "$pwm_dir"
+            return 1
+        fi
     fi
-    pm_atomic_write "$pwm_dir/last" "$PM_PARSED_TOKEN" || { rm -rf "$pwm_dir"; return 1; }
-    pm_atomic_write "$pwm_dir/detail" "$PM_PARSED_DETAIL" || { rm -rf "$pwm_dir"; return 1; }
-    pwm_next="$(pm_next_due "$pwm_now" "$pwm_interval" "$pwm_id")"
-    pm_atomic_write "$pwm_dir/nextDue" "$pwm_next" || { rm -rf "$pwm_dir"; return 1; }
+    if [ "$pwm_sandbox" -eq 0 ]; then
+        pm_atomic_write "$pwm_dir/last" "$PM_PARSED_TOKEN" || { rm -rf "$pwm_dir"; return 1; }
+        pm_atomic_write "$pwm_dir/detail" "$PM_PARSED_DETAIL" || { rm -rf "$pwm_dir"; return 1; }
+        pwm_next="$(pm_next_due "$pwm_now" "$pwm_interval" "$pwm_id")"
+        pm_atomic_write "$pwm_dir/nextDue" "$pwm_next" || { rm -rf "$pwm_dir"; return 1; }
+    fi
     printf 'watch %s registered: token=%s\n' "$pwm_id" "$PM_PARSED_TOKEN"
     if [ "$pwm_failsafe" -eq 1 ]; then
         if [ -z "$pwm_provider" ]; then
@@ -1716,15 +1742,17 @@ labels=$pwm_labels"
     pwm_trigger="$(pm_trigger_state)"
     log_line "$pwm_dir" TRIGGER "$pwm_trigger" || :
     [ "$pwm_trigger" = stale ] && pm_self_heal_trigger || :
-    if pm_terminal_token "$PM_PARSED_TOKEN" "$pwm_terminal"; then
-        pm_report_event "$pwm_dir" terminal "(none)" "$PM_PARSED_TOKEN" "$PM_PARSED_DETAIL" || :
-        if [ ! -f "$pwm_dir/undelivered" ]; then
-            set_state "$pwm_dir" terminal || :
-            pm_clear_failsafe "$pwm_dir"
+    if [ "$pwm_sandbox" -eq 0 ]; then
+        if pm_terminal_token "$PM_PARSED_TOKEN" "$pwm_terminal"; then
+            pm_report_event "$pwm_dir" terminal "(none)" "$PM_PARSED_TOKEN" "$PM_PARSED_DETAIL" || :
+            if [ ! -f "$pwm_dir/undelivered" ]; then
+                set_state "$pwm_dir" terminal || :
+                pm_clear_failsafe "$pwm_dir"
+            fi
+        elif [ "$pwm_start_report" -eq 1 ]; then
+            pm_report_event "$pwm_dir" started "(none)" "$PM_PARSED_TOKEN" "$PM_PARSED_DETAIL" 1 0 || :
+            [ -f "$pwm_dir/undelivered" ] && set_state "$pwm_dir" active || :
         fi
-    elif [ "$pwm_start_report" -eq 1 ]; then
-        pm_report_event "$pwm_dir" started "(none)" "$PM_PARSED_TOKEN" "$PM_PARSED_DETAIL" 1 0 || :
-        [ -f "$pwm_dir/undelivered" ] && set_state "$pwm_dir" active || :
     fi
     rm -f "$pwm_out" "$pwm_err"
     pwm_attempts=$(( (pwm_deadline_epoch - pwm_now + pwm_interval - 1) / pwm_interval ))

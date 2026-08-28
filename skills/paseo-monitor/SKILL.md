@@ -29,6 +29,19 @@ paseo-monitor watch --kind slurm --host cannon --job 24211558 --deadline +3600
 when `--deliver paseo-queue` is selected; without a delivery backend,
 registration records the watch and its reports locally.
 
+### Sandboxed callers
+
+Sandboxed callers can register remote watches even when their environment
+cannot perform the registration probe. In that case, registration prints an
+expected WARN, creates a genuinely live watch, and the first observation comes
+from the sweeper rather than registration. The sweeper is intentionally
+unsandboxed under `launchd`, so it can reach the cluster when the caller
+cannot. The WARN describes the caller's probe limitation; it is not a fault.
+
+The tool does not add `-o ControlMaster=no`: `PLAN.md` requires respecting
+the user's SSH configuration, and disabling the socket would only address one
+of the two sandbox restrictions, not the DNS restriction.
+
 `paseo-monitor version` or `paseo-monitor --version` prints the release version.
 
 ## Ownership and removal

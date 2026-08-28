@@ -31,6 +31,18 @@ assert_rc "$rc" 255 "ssh network failure rc"
 assert_eq "$(pm_health_failure_class "$rc" "$(cat "$remote_dir/err")")" network "ssh network classification"
 assert_grep "$remote_dir/err" 'network-class ssh-rc=255' "network class evidence"
 
+mock_ssh_script "255${tab}${tab}Control socket connect(/x): Operation not permitted\\nssh: Could not resolve hostname h: -65563"
+pm_run_remote_probe "$remote_dir/out" "$remote_dir/err" cannon ls -d /scratch/result
+rc=$?
+assert_rc "$rc" 255 "ssh sandbox failure rc"
+assert_eq "$(pm_health_failure_class "$rc" "$(cat "$remote_dir/err")")" sandbox "ssh sandbox classification"
+assert_grep "$remote_dir/err" 'sandbox-class ssh-rc=255' "sandbox class evidence"
+
+assert_eq "$(pm_health_failure_class 255 "Permission denied (publickey)")" auth "auth remains auth"
+assert_eq "$(pm_health_failure_class 255 "Connection timed out")" network "network remains network"
+assert_eq "$(pm_health_failure_class 255 "Operation not permitted")" network "unqualified permission remains network"
+assert_eq "$(pm_health_failure_class 1 "[Errno 1] Operation not permitted")" sandbox "errno sandbox classification"
+
 mock_ssh_script "0${tab}/scratch/result"
 pm_run_registered_probe "$remote_dir" "$remote_dir/out" "$remote_dir/err" || fail "remote file probe failed"
 pm_parse_probe_output "$remote_dir/out" || fail "remote file output invalid"

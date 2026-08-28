@@ -453,7 +453,19 @@ def pm_parse_probe_output(source):
     return True
 
 
+def _is_sandbox_error(text):
+    lowered = text.lower()
+    if "-65563" in lowered:
+        return True
+    return (
+        "operation not permitted" in lowered
+        and ("control socket" in lowered or "[errno 1]" in lowered)
+    )
+
+
 def _classify_ssh_error(text):
+    if _is_sandbox_error(text):
+        return "sandbox"
     lowered = text.lower()
     return "auth" if any(word in lowered for word in (
         "authentication", "permission denied", "permission", "auth ",
@@ -469,6 +481,8 @@ def health_failure_class(returncode, stderr):
         return "env-unavailable"
     if returncode == 127:
         return "config"
+    if _is_sandbox_error(lowered):
+        return "sandbox"
     if returncode == 255 and any(word in lowered for word in (
         "authentication", "permission", "auth", "assword", "passphrase",
         "verification", "mfa", "keyboard-interactive",
@@ -1333,7 +1347,7 @@ def prepare_registration(values, now=None):
 
 
 def register_watch(values, config=CONFIG, now=None, watch_id=None):
-    """Create a durable watch only after its synchronous first probe succeeds."""
+    """Create a durable watch after probing, or defer sandbox failures."""
     now = pm_now() if now is None else int(now)
     spec = prepare_registration(values, now)
     ensure_dirs(config.home)
@@ -1393,34 +1407,56 @@ def register_watch(values, config=CONFIG, now=None, watch_id=None):
         atomic_write(directory / "state", "active")
         out, err = directory / ".register.stdout", directory / ".register.stderr"
         rc = _spec_probe(directory, spec, out, err, config)
+        sandboxed = False
         if rc:
             message = err.read_text(encoding="utf-8", errors="replace") if err.is_file() else ""
-            raise RuntimeError("registration probe failed (health rc=%s)%s" % (
-                rc, ": %s" % message.strip() if message.strip() else ""
-            ))
-        observation = parse_probe_output(out)
-        atomic_write(directory / "last", observation.token)
-        atomic_write(directory / "detail", observation.detail)
+            # Built-in probes may be retried by the unsandboxed sweeper; a
+            # script failure belongs to the watch specification and aborts.
+            if kind != "script" and health_failure_class(rc, message) == "sandbox":
+                if message.strip():
+                    print(message.rstrip(), file=sys.stderr)
+                print(
+                    "paseo-monitor: WARN registration probe unavailable in caller sandbox; "
+                    "sweeper will make the first observation",
+                    file=sys.stderr,
+                )
+                sandboxed = True
+                observation = ProbeObservation(
+                    "UNOBSERVED",
+                    "registration probe unavailable in caller sandbox; "
+                    "sweeper will make the first observation",
+                )
+                atomic_write(directory / "nextDue", str(now))
+            else:
+                raise RuntimeError("registration probe failed (health rc=%s)%s" % (
+                    rc, ": %s" % message.strip() if message.strip() else ""
+                ))
+        else:
+            observation = parse_probe_output(out)
+        if not sandboxed:
+            atomic_write(directory / "last", observation.token)
+            atomic_write(directory / "detail", observation.detail)
+            atomic_write(directory / "nextDue", next_due(now, int(spec["interval"]), watch_id, config))
         log_line(directory, "REGISTER", "token=%s" % observation.token,
                  "detail=%s" % observation.detail, config=config)
-        atomic_write(directory / "nextDue", next_due(now, int(spec["interval"]), watch_id, config))
         if config.shell_report:
             log_line(directory, "TRIGGER", "fresh", config=config)
-        terminal = observation.token in _terminal_tokens(spec)
-        if terminal:
-            delivered = report_event(
-                directory, "terminal", "(none)", observation.token,
-                observation.detail, config=config, observed_epoch=now,
-            )
-            set_state(directory, "terminal" if delivered else "active")
-        elif _truthy(spec.get("start_report", True)):
-            report_event(
-                directory, "started", "(none)", observation.token,
-                observation.detail, config=config, exempt=True,
-                count_fire=False, observed_epoch=now,
-            )
-            if (directory / "undelivered").is_file():
-                set_state(directory, "active")
+        if not sandboxed:
+            terminal = observation.token in _terminal_tokens(spec)
+            if terminal:
+                delivered = report_event(
+                    directory, "terminal", "(none)", observation.token,
+                    observation.detail, config=config, observed_epoch=now,
+                )
+                set_state(directory, "terminal" if delivered else "active")
+            elif _truthy(spec.get("start_report", True)):
+                report_event(
+                    directory, "started", "(none)", observation.token,
+                    observation.detail, config=config, exempt=True,
+                    count_fire=False, observed_epoch=now,
+                )
+                if (directory / "undelivered").is_file():
+                    set_state(directory, "active")
         return watch_id, observation
     except Exception:
         shutil.rmtree(str(directory), ignore_errors=True)
