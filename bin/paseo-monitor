@@ -1,92 +1,1869 @@
-#!/bin/sh
-# paseo-monitor: stateless launchd-driven watcher for long-running work.
-# POSIX sh only; see AGENTS.md for the portability and disposability contract.
-set -u
-PM_VERSION="v1.3.0"
+#!/usr/bin/env python3
+"""Python foundation for paseo-monitor.
 
-# External knobs are read exactly once here. Runtime code uses PM_* only.
-PM_HOME="${PASEO_MONITOR_HOME:-$HOME/.paseo-monitor}"
-PM_LOG_MAX_BYTES="${PASEO_MONITOR_LOG_MAX_BYTES:-5242880}"
-PM_LOCK_GRACE_SECONDS="${PASEO_MONITOR_LOCK_GRACE_SECONDS:-5}"
-PM_BACKOFF_SCALE="${PASEO_MONITOR_BACKOFF_SCALE:-1}"
-PM_FAST_SWEEP="${PASEO_MONITOR_FAST_SWEEP:-0}"
-PM_PROBE_TIMEOUT="${PASEO_MONITOR_PROBE_TIMEOUT:-45}"
-PM_CONTEXT_MAX=512
-case "$PM_LOG_MAX_BYTES" in ''|*[!0-9]*) PM_LOG_MAX_BYTES=5242880 ;; esac
-case "$PM_LOCK_GRACE_SECONDS" in ''|*[!0-9]*) PM_LOCK_GRACE_SECONDS=5 ;; esac
-case "$PM_BACKOFF_SCALE" in ''|*[!0-9]*) PM_BACKOFF_SCALE=1 ;; esac
-case "$PM_FAST_SWEEP" in 0|1) ;; *) PM_FAST_SWEEP=0 ;; esac
-case "$PM_PROBE_TIMEOUT" in ''|*[!0-9]*) PM_PROBE_TIMEOUT=45 ;; esac
-PM_LAUNCHD_LABEL=com.paseo-monitor.sweep
-PM_INSTALLER="${PASEO_MONITOR_INSTALLER:-$(dirname "$0")/../install.sh}"
-PM_RUNTIME_DIR="$(CDPATH= cd -- "$(dirname "$0")" 2>/dev/null && pwd)"
-PM_PYTHON_RESOLVER="${PM_PYTHON_RESOLVER:-$PM_RUNTIME_DIR/resolve-python3}"
-if [ ! -x "$PM_PYTHON_RESOLVER" ]; then
-    PM_INSTALLER_DIR="$(CDPATH= cd -- "$(dirname "$PM_INSTALLER")" 2>/dev/null && pwd)"
-    if [ -x "$PM_INSTALLER_DIR/bin/resolve-python3" ]; then
-        PM_PYTHON_RESOLVER="$PM_INSTALLER_DIR/bin/resolve-python3"
-    fi
-fi
-PM_PYTHON="${PASEO_MONITOR_PYTHON:-}"
-if [ -z "$PM_PYTHON" ] && [ -x "$PM_PYTHON_RESOLVER" ]; then
-    PM_PYTHON="$("$PM_PYTHON_RESOLVER" 2>/dev/null || printf '')"
-fi
-PM_PY_AGENT_PROBE='import json,sys; d=json.load(sys.stdin); status=str(d.get("Status",d.get("status","UNKNOWN"))).upper(); archived=bool(d.get("Archived",d.get("archived",False))) or bool(d.get("ArchivedAt",d.get("archivedAt",""))); perms=d.get("PendingPermissions",d.get("pendingPermissions",[])); perms=perms if isinstance(perms,list) else []; updated=d.get("UpdatedAt",d.get("updatedAt","")); token="ARCHIVED" if archived else ("BLOCKED-PERMISSION" if perms else status); prefix="went idle " if token=="IDLE" else ""; idle=(" idle_since="+str(updated)) if token=="IDLE" else ""; print("%s %sstatus=%s archived=%s pendingPermissions=%d queue_depth=%d updated_at=%s%s" % (token,prefix,status,str(archived).lower(),len(perms),len(perms),str(updated),idle))'
-PM_PY_GLOBUS_PROBE="$(cat <<'PY'
-import json, sys
-data = json.load(sys.stdin)
-status = str(data.get("status", data.get("Status", "UNKNOWN"))).upper()
-def field(name):
-    value = data.get(name, "")
-    if value is None:
+This module deliberately grows beside the shell entrypoint.  P5 owns the public
+CLI cutover; the functions here are the durable state, probe, and sweep
+primitives that can read watches written by the shell implementation.
+"""
+
+from __future__ import print_function
+
+import argparse
+import json
+import os
+import re
+import shutil
+import signal
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+import uuid
+import zlib
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass, replace
+from pathlib import Path
+
+
+TIMESTAMP_FORMAT = "%Y-%m-%dT%H:%M:%S%z"
+SPEC_KEYS = (
+    "kind", "report_to", "owner", "provider", "interval", "deadline",
+    "registered", "terminal", "report_on", "with_reason",
+    "report_transitions", "dwell", "prohibit", "failsafe", "max_runs",
+    "expires_in", "expire_undelivered", "undelivered_at", "max_fires",
+    "exhausted", "start_report", "deliver",
+    "deliver_mode", "python", "helper", "reason", "script", "host",
+    "job", "task", "agent", "path", "remote", "ref", "repo", "pr",
+    "labels",
+)
+STDOUT_CAP = 4096
+STDERR_CAP = 8192
+SWEEP_PARALLELISM = 4
+
+
+def _uint(value, default):
+    if value is None or value == "" or not str(value).isdigit():
+        return default
+    return int(value)
+
+
+@dataclass(frozen=True)
+class Config:
+    """Internal startup configuration; external names are read only here."""
+
+    home: Path
+    log_max_bytes: int = 5242880
+    lock_grace_seconds: int = 5
+    backoff_scale: int = 1
+    fast_sweep: bool = False
+    probe_timeout: int = 45
+    context_max: int = 512
+    sweep_parallelism: int = SWEEP_PARALLELISM
+    shell_report: bool = False
+
+
+    @classmethod
+    def from_env(cls, environ=None):
+        env = os.environ if environ is None else environ
+        home = env.get("PASEO_MONITOR_HOME") or os.path.join(
+            env.get("HOME", os.path.expanduser("~")), ".paseo-monitor"
+        )
+        fast = env.get("PASEO_MONITOR_FAST_SWEEP", "0")
+        return cls(
+            home=Path(home),
+            log_max_bytes=_uint(env.get("PASEO_MONITOR_LOG_MAX_BYTES", "5242880"), 5242880),
+            lock_grace_seconds=_uint(env.get("PASEO_MONITOR_LOCK_GRACE_SECONDS", "5"), 5),
+            backoff_scale=_uint(env.get("PASEO_MONITOR_BACKOFF_SCALE", "1"), 1),
+            fast_sweep=fast in ("1", 1),
+            probe_timeout=_uint(env.get("PASEO_MONITOR_PROBE_TIMEOUT", "45"), 45),
+        )
+
+
+# This is the sole startup read. Runtime functions receive CONFIG or use these
+# immutable aliases; they do not inspect PASEO_MONITOR_* themselves.
+CONFIG = Config.from_env()
+PM_HOME = CONFIG.home
+PM_LOG_MAX_BYTES = CONFIG.log_max_bytes
+PM_LOCK_GRACE_SECONDS = CONFIG.lock_grace_seconds
+PM_BACKOFF_SCALE = CONFIG.backoff_scale
+PM_FAST_SWEEP = int(CONFIG.fast_sweep)
+PM_PROBE_TIMEOUT = CONFIG.probe_timeout
+PM_SWEEP_PARALLELISM = CONFIG.sweep_parallelism
+
+
+@dataclass(frozen=True)
+class ProbeResult:
+    returncode: int
+    stdout: bytes
+    stderr: bytes
+    timed_out: bool = False
+
+
+@dataclass(frozen=True)
+class ProbeObservation:
+    token: str
+    detail: str
+
+
+@dataclass(frozen=True)
+class SweepResult:
+    skipped: bool = False
+    processed: int = 0
+
+
+class AgentResolutionError(RuntimeError):
+    def __init__(self, message, code=2):
+        super().__init__(message)
+        self.code = code
+
+
+_TZ_LOCK = threading.Lock()
+def timestamp(epoch=None):
+    """DST-correct New York time without zoneinfo (works on Python 3.8)."""
+    with _TZ_LOCK:
+        previous = os.environ.get("TZ")
+        os.environ["TZ"] = "America/New_York"
+        time.tzset()
+        try:
+            return time.strftime(TIMESTAMP_FORMAT, time.localtime(epoch))
+        finally:
+            if previous is None:
+                os.environ.pop("TZ", None)
+            else:
+                os.environ["TZ"] = previous
+            time.tzset()
+
+
+def _as_bytes(content, newline=True):
+    if isinstance(content, bytes):
+        return content + (b"\n" if newline else b"")
+    value = str(content).encode("utf-8")
+    return value + (b"\n" if newline else b"")
+
+
+def atomic_write_bytes(path, content):
+    """Install bytes with the shell-compatible temporary-file-plus-rename."""
+    target = Path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    temporary = target.parent / (".tmp.%s.%s" % (os.getpid(), target.name))
+    try:
+        with open(str(temporary), "wb") as handle:
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(str(temporary), str(target))
+    finally:
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
+
+
+def atomic_write(path, content):
+    atomic_write_bytes(path, _as_bytes(content))
+
+
+def pm_atomic_write(path, content):
+    return atomic_write(path, content)
+
+
+def set_state(directory, state):
+    try:
+        atomic_write(Path(directory) / "state", state)
+        return True
+    except OSError:
+        return False
+
+
+def ensure_dirs(directory):
+    root = Path(directory)
+    (root / "watches").mkdir(parents=True, exist_ok=True)
+    (root / "graveyard").mkdir(parents=True, exist_ok=True)
+    return True
+
+
+def load_config(environ=None):
+    return Config.from_env(environ)
+
+
+class Spec(dict):
+    """Mapping with the original bytes needed for lossless persistence."""
+
+    def __init__(self, *args, **kwargs):
+        self.raw = kwargs.pop("raw", None)
+        super().__init__(*args, **kwargs)
+        self._snapshot = dict(self)
+
+
+def read_spec(path):
+    """Read shell spec key/value records, retaining values after the first =."""
+    raw_bytes = Path(path).read_bytes()
+    result = Spec(raw=raw_bytes)
+    for raw in raw_bytes.splitlines():
+        line = raw.decode("utf-8", "replace")
+        if "=" in line:
+            key, value = line.split("=", 1)
+            if key not in result:
+                result[key] = value
+    result._snapshot = dict(result)
+    return result
+
+
+def serialize_spec(values):
+    if isinstance(values, Spec) and values.raw is not None and dict(values) == values._snapshot:
+        return values.raw
+    if isinstance(values, (bytes, bytearray)):
+        return bytes(values)
+    keys = list(SPEC_KEYS) + [key for key in values if key not in SPEC_KEYS]
+    items = []
+    for key in keys:
+        if key in values:
+            items.append("%s=%s" % (key, values[key]))
+    return ("\n".join(items) + "\n").encode("utf-8")
+
+
+def write_spec(path, values):
+    """Write canonical shell specs, or exact bytes when handed a byte string."""
+    atomic_write_bytes(path, serialize_spec(values))
+
+
+def update_spec(path, key, value):
+    """Change one spec field without changing other fields or their order."""
+    source = Path(path).read_bytes().splitlines(keepends=True)
+    prefix = (str(key) + "=").encode("utf-8")
+    replacement = (str(key) + "=" + str(value) + "\n").encode("utf-8")
+    replaced = False
+    output = []
+    for line in source:
+        if line.startswith(prefix):
+            output.append(replacement)
+            replaced = True
+        else:
+            output.append(line)
+    if not replaced:
+        output.append(replacement)
+    atomic_write_bytes(path, b"".join(output))
+
+
+def _log_path(directory, config=CONFIG):
+    directory = Path(directory)
+    return config.home / "sweep.log" if directory == config.home else directory / "log"
+
+
+def rotate_log_if_big(directory, config=CONFIG):
+    log = _log_path(directory, config)
+    try:
+        if log.is_file() and log.stat().st_size >= config.log_max_bytes:
+            os.replace(str(log), str(log) + ".1")
+    except OSError:
+        return False
+    return True
+
+
+def log_line(directory, event, *details, **kwargs):
+    config = kwargs.pop("config", CONFIG)
+    log = _log_path(directory, config)
+    Path(directory).mkdir(parents=True, exist_ok=True)
+    line = "%s [%s] %s %s\n" % (timestamp(), os.getpid(), event, " ".join(str(x) for x in details))
+    with open(str(log), "a", encoding="utf-8") as handle:
+        handle.write(line)
+    return rotate_log_if_big(directory, config)
+
+
+def pm_log_path(directory, config=CONFIG):
+    return str(_log_path(directory, config))
+
+
+def pm_rotate_log_if_big(directory, config=CONFIG):
+    return rotate_log_if_big(directory, config)
+
+
+def _pid_alive(pid):
+    try:
+        os.kill(pid, 0)
+    except (OSError, ValueError):
+        return False
+    return True
+
+
+def lock_holder_alive(directory, config=CONFIG):
+    lock = Path(directory) / "sweep.lock"
+    if not lock.is_dir():
+        return False
+    pid_file = lock / "pid"
+    if pid_file.is_file():
+        try:
+            value = pid_file.read_text(encoding="ascii").strip()
+            if not value.isdigit():
+                return False
+            return _pid_alive(int(value))
+        except (OSError, UnicodeError):
+            return False
+    try:
+        return time.time() - lock.stat().st_mtime < config.lock_grace_seconds
+    except OSError:
+        return False
+
+
+def _break_stale_lock(directory):
+    root = Path(directory)
+    lock = root / "sweep.lock"
+    stale = root / ("sweep.lock.stale.%s" % os.getpid())
+    try:
+        os.replace(str(lock), str(stale))
+    except OSError:
+        return False
+    shutil.rmtree(str(stale), ignore_errors=True)
+    return True
+
+
+def acquire_lock(directory, config=CONFIG):
+    root = Path(directory)
+    root.mkdir(parents=True, exist_ok=True)
+    lock = root / "sweep.lock"
+    try:
+        lock.mkdir()
+    except FileExistsError:
+        if lock_holder_alive(root, config):
+            return False
+        _break_stale_lock(root)
+        try:
+            lock.mkdir()
+        except FileExistsError:
+            return False
+    try:
+        (lock / "pid").write_text("%s\n" % os.getpid(), encoding="ascii")
+    except OSError:
+        shutil.rmtree(str(lock), ignore_errors=True)
+        return False
+    return True
+
+
+def release_lock(directory):
+    lock = Path(directory) / "sweep.lock"
+    if not lock.is_dir():
+        return True
+    pid_file = lock / "pid"
+    try:
+        if not pid_file.is_file() or pid_file.read_text(encoding="ascii").strip() != str(os.getpid()):
+            return False
+        shutil.rmtree(str(lock))
+        return True
+    except OSError:
+        return False
+
+
+def pm_acquire_lock(directory, config=CONFIG):
+    return acquire_lock(directory, config)
+
+
+def pm_release_lock(directory):
+    return release_lock(directory)
+
+
+def pm_lock_holder_alive(directory, config=CONFIG):
+    return lock_holder_alive(directory, config)
+
+
+def pm_ensure_dirs(directory):
+    return ensure_dirs(directory)
+
+
+def pm_now():
+    return int(time.time())
+
+
+def hash_jitter(watch_id, interval, config=CONFIG):
+    if config.fast_sweep:
+        return 0
+    interval = max(int(interval), 1)
+    return zlib.crc32(str(watch_id).encode("utf-8")) % interval
+
+
+def next_due(now, interval, watch_id, config=CONFIG):
+    now, interval = int(now), int(interval)
+    return now if config.fast_sweep else now + interval + hash_jitter(watch_id, interval, config)
+
+
+def _cap(data, limit):
+    if data is None:
+        return b""
+    if isinstance(data, str):
+        data = data.encode("utf-8", "replace")
+    return data[:limit]
+
+
+def run_probe(argv, timeout=None, config=CONFIG):
+    """Execute argv directly with inherited env, /dev/null stdin, and caps."""
+    if isinstance(argv, (str, bytes)) or not argv:
+        raise TypeError("probe argv must be a non-empty sequence")
+    seconds = config.probe_timeout if timeout is None else timeout
+    try:
+        completed = subprocess.run(
+            list(argv), stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE, timeout=seconds, check=False,
+        )
+        return ProbeResult(completed.returncode, _cap(completed.stdout, STDOUT_CAP),
+                           _cap(completed.stderr, STDERR_CAP), False)
+    except subprocess.TimeoutExpired as exc:
+        return ProbeResult(124, _cap(exc.output, STDOUT_CAP), _cap(exc.stderr, STDERR_CAP), True)
+    except OSError as exc:
+        return ProbeResult(127, b"", _cap(str(exc), STDERR_CAP), False)
+
+
+def run_with_timeout(seconds, stdout_path, stderr_path, *argv, **kwargs):
+    config = kwargs.pop("config", CONFIG)
+    result = run_probe(argv, timeout=seconds, config=config)
+    Path(stdout_path).parent.mkdir(parents=True, exist_ok=True)
+    Path(stderr_path).parent.mkdir(parents=True, exist_ok=True)
+    Path(stdout_path).write_bytes(result.stdout)
+    Path(stderr_path).write_bytes(result.stderr)
+    return result.returncode
+
+
+def pm_run_with_timeout(seconds, stdout_path, stderr_path, *argv, **kwargs):
+    return run_with_timeout(seconds, stdout_path, stderr_path, *argv, **kwargs)
+
+
+def parse_probe_output(source):
+    data = Path(source).read_bytes() if isinstance(source, (str, os.PathLike)) else source
+    if hasattr(data, "read"):
+        data = data.read()
+    if isinstance(data, str):
+        data = data.encode("utf-8")
+    line = data.splitlines()[0].decode("utf-8", "replace") if data.splitlines() else ""
+    match = re.match(r"([^\s]+)(?:[ \t]+(.*))?$", line)
+    if not match:
+        raise ValueError("probe output is empty or has no token")
+    return ProbeObservation(match.group(1), match.group(2) or "")
+
+
+PM_PARSED_TOKEN = ""
+PM_PARSED_DETAIL = ""
+
+
+def pm_parse_probe_output(source):
+    global PM_PARSED_TOKEN, PM_PARSED_DETAIL
+    try:
+        observation = parse_probe_output(source)
+    except ValueError:
+        return False
+    PM_PARSED_TOKEN, PM_PARSED_DETAIL = observation.token, observation.detail
+    return True
+
+
+def _is_sandbox_error(text):
+    lowered = text.lower()
+    if "-65563" in lowered:
+        return True
+    return (
+        "operation not permitted" in lowered
+        and ("control socket" in lowered or "[errno 1]" in lowered)
+    )
+
+
+def _classify_ssh_error(text):
+    if _is_sandbox_error(text):
+        return "sandbox"
+    lowered = text.lower()
+    return "auth" if any(word in lowered for word in (
+        "authentication", "permission denied", "permission", "auth ",
+        "auth:", "passphrase", "password", "verification",
+        "mfa", "keyboard-interactive",
+    )) else "network"
+
+
+def health_failure_class(returncode, stderr):
+    text = stderr.decode("utf-8", "replace") if isinstance(stderr, bytes) else str(stderr)
+    lowered = text.lower()
+    if "env-unavailable" in lowered:
+        return "env-unavailable"
+    if returncode == 127:
+        return "config"
+    if _is_sandbox_error(lowered):
+        return "sandbox"
+    if returncode == 255 and any(word in lowered for word in (
+        "authentication", "permission", "auth", "assword", "passphrase",
+        "verification", "mfa", "keyboard-interactive",
+    )):
+        return "auth"
+    return "network"
+
+
+def pm_health_failure_class(returncode, stderr):
+    return health_failure_class(returncode, stderr)
+
+
+def run_remote_probe(stdout_path, stderr_path, host, *remote_argv, **kwargs):
+    config = kwargs.pop("config", CONFIG)
+    result = run_probe(("ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=15", host) + remote_argv,
+                       config=config)
+    err = result.stderr.decode("utf-8", "replace")
+    if result.returncode == 255:
+        classification = _classify_ssh_error(err)
+        err = "%s-class ssh-rc=255\n%s" % (classification, err)
+    Path(stdout_path).parent.mkdir(parents=True, exist_ok=True)
+    Path(stderr_path).parent.mkdir(parents=True, exist_ok=True)
+    Path(stdout_path).write_bytes(result.stdout)
+    Path(stderr_path).write_bytes(_cap(err, STDERR_CAP))
+    return result.returncode
+
+
+def pm_run_remote_probe(stdout_path, stderr_path, host, *remote_argv, **kwargs):
+    return run_remote_probe(stdout_path, stderr_path, host, *remote_argv, **kwargs)
+
+
+def _first_nonempty(lines):
+    return next((line for line in lines if line.strip()), "")
+
+
+def parse_slurm_probe_output(watch_dir, output_path):
+    lines = Path(output_path).read_text(encoding="utf-8", errors="replace").splitlines()
+    before, marker, after = [], False, []
+    for line in lines:
+        if line == "PASEO_MONITOR_SQUEUE":
+            marker = True
+            continue
+        (after if marker else before).append(line)
+    sacct = _first_nonempty(before)
+    squeue = _first_nonempty(after)
+    state = sacct or (squeue.split("|", 1)[0] if squeue else "")
+    if "|" in state:
+        state = state.split("|", 1)[-1].split("|", 1)[0]
+    state = state.split()[0] if state.split() else ""
+    if state:
+        token, detail = state, "sacct=%s" % sacct
+        if squeue:
+            if squeue.split("|", 1)[0] == "PENDING" and "|" in squeue:
+                token = "PENDING:" + squeue.split("|", 1)[1]
+            detail += " squeue=%s" % squeue
+    else:
+        last_path = Path(watch_dir) / "last"
+        last = last_path.read_text(
+            encoding="utf-8", errors="replace"
+        ).strip() if last_path.is_file() else ""
+        detail_path = Path(watch_dir) / "detail"
+        prior_detail = detail_path.read_text(
+            encoding="utf-8", errors="replace"
+        ) if detail_path.is_file() else ""
+        queue_match = re.search(r"(?:^| )squeue=([^ ]*)", prior_detail)
+        prior_queue = bool(queue_match and queue_match.group(1).split("|", 1)[0])
+        if marker and last not in ("", "PENDING") and prior_queue:
+            token, detail = "VANISHED", "sacct and squeue empty after last=%s" % last
+        else:
+            token, detail = "PENDING", "sacct empty (accounting lag); squeue=%s" % squeue
+    atomic_write(output_path, "%s %s" % (token, detail))
+
+
+def pm_slurm_probe_output(watch_dir, output_path):
+    return parse_slurm_probe_output(watch_dir, output_path)
+
+
+def parse_pbs_probe_output(watch_dir, output_path):
+    lines = Path(output_path).read_text(encoding="utf-8", errors="replace").splitlines()
+    marker = "PASEO_MONITOR_PBS_HISTORICAL"
+    split = lines.index(marker) if marker in lines else len(lines)
+    live, historical = lines[:split], lines[split + 1:]
+    def state(rows):
+        for row in rows:
+            match = re.match(r"\s*job_state\s*=\s*(\S+)", row)
+            if match:
+                return match.group(1).split()[0].upper()
         return ""
-    if isinstance(value, (dict, list)):
-        return json.dumps(value, separators=(",", ":"))
-    return str(value).replace("\n", " ")
-print("%s nice_status=%s faults=%s fatal_error=%s effective_bytes_per_second=%s" % (
-    status, field("nice_status"), field("faults"), field("fatal_error"),
-    field("effective_bytes_per_second")))
-PY
-)"
-PM_PY_HARVEST_LABELS='import json,sys; d=json.load(sys.stdin); d=d[0] if isinstance(d,list) and d else d; labels=d.get("Labels",d.get("labels",{})) if isinstance(d,dict) else {}; labels=labels if isinstance(labels,dict) else {}; print("|".join("%s=%s" % (k,str(labels[k]).replace("|"," ").replace("\n"," ")) for k in ("role","job","item","lane") if k in labels and labels[k] is not None))'
-PM_PY_SCHEDULE_ID='import json,sys; d=json.load(sys.stdin); d=d if isinstance(d,dict) else {}; print(d.get("id",d.get("scheduleId",d.get("schedule_id",""))))'
-PM_PY_CALLER_PROVIDER='import json,sys; d=json.load(sys.stdin); print(d.get("Provider",d.get("provider","")) if isinstance(d,dict) else "")'
-PM_PY_DEFAULT_PROVIDER='import json,sys; d=json.load(sys.stdin); print(next((str(x.get("provider","")) for x in d if isinstance(x,dict) and str(x.get("status","")).lower()=="available" and str(x.get("enabled","")).lower()=="enabled"),"") if isinstance(d,list) else "")'
+    current = state(live)
+    source, record = "qstat", live
+    if not current and historical:
+        current, source, record = state(historical), "qstat-x", historical
+    if current:
+        detail = "%s=%s" % (source, " ".join(record)[:384])
+        atomic_write(output_path, "%s %s" % (current, detail))
+    else:
+        atomic_write(output_path, "UNKNOWN qstat live and historical lookup empty")
 
-LC_ALL=C
-export LC_ALL
-umask 077
 
-pm_kind_table() {
-    printf '%s\n' \
-        'slurm | Slurm job state | --host <host> --job <id> [--report-transitions] [--report-on <tokens>] [--with-reason] --deadline <when> | floor=120 | default=600 terminal-only, 300 transitions' \
-        'pbs | PBS job state | --host <host> --job <id> [--report-transitions] [--report-on <tokens>] --deadline <when> | floor=120 | default=600 terminal-only, 300 transitions' \
-        'globus | Globus transfer status | --task <id> --deadline <when> | floor=60 | default=300' \
-        'agent | Paseo agent status | --agent <id> [--report-on <tokens>] [--dwell <sweeps>] --deadline <when> | floor=60 | default=60, dwell=2' \
-        'file-exists | Absence / receipt pattern; job-id-keyed watches cannot observe a target that never entered the queue | --path <receipt-path> [--host <host>] --deadline <when> | floor=60 local, 120 remote | default=60 local, 120 remote | example: paseo-monitor watch --kind file-exists --path /scratch/run/receipt --deadline +3600' \
-        'git-ref | Git ref SHA | --remote <remote> --ref <ref> --deadline <when> | floor=60 | default=120' \
-        'pr-merge | Pull request merge state | --repo <owner/repo> --pr <number> --deadline <when> | floor=60 | default=300' \
-        'script | Custom executable | --script <file> --reason "<why no kind fits>" --deadline <when> | floor=60 | default=60'
+def _json_data(value):
+    if hasattr(value, "read"):
+        return json.load(value)
+    if isinstance(value, os.PathLike):
+        with open(str(value), "r", encoding="utf-8") as handle:
+            return json.load(handle)
+    if isinstance(value, (bytes, str)):
+        text = value.decode("utf-8") if isinstance(value, bytes) else value
+        if os.path.isfile(text):
+            with open(text, "r", encoding="utf-8") as handle:
+                return json.load(handle)
+        return json.loads(text)
+    return value
+
+
+def _json_object(source):
+    value = _json_data(source)
+    if not isinstance(value, dict):
+        raise ValueError("probe JSON must be an object")
+    return value
+
+
+def parse_agent_probe_output(source):
+    """Map the observable paseo inspect fields to a stable watch token."""
+    agent = _json_object(source)
+    status = str(agent.get("Status", agent.get("status", "UNKNOWN"))).upper()
+    archived = bool(agent.get("Archived", agent.get("archived", False)))
+    archived = archived or bool(agent.get("ArchivedAt", agent.get("archivedAt", "")))
+    permissions = agent.get("PendingPermissions", agent.get("pendingPermissions", []))
+    if not isinstance(permissions, list):
+        permissions = []
+    updated = str(agent.get("UpdatedAt", agent.get("updatedAt", "")))
+    token = "ARCHIVED" if archived else (
+        "BLOCKED-PERMISSION" if permissions else status
+    )
+    prefix = "went idle " if token == "IDLE" else ""
+    idle = " idle_since=%s" % updated if token == "IDLE" else ""
+    detail = (
+        "%sstatus=%s archived=%s pendingPermissions=%d queue_depth=%d "
+        "updated_at=%s%s"
+        % (prefix, status, str(archived).lower(), len(permissions),
+           len(permissions), updated, idle)
+    )
+    return ProbeObservation(token, detail)
+
+
+def parse_globus_probe_output(source):
+    data = _json_object(source)
+
+    def field(name):
+        value = data.get(name, "")
+        if value is None:
+            return ""
+        if isinstance(value, (dict, list)):
+            return json.dumps(value, separators=(",", ":"))
+        return str(value).replace("\n", " ")
+
+    status = str(data.get("status", data.get("Status", "UNKNOWN"))).upper()
+    if status not in ("ACTIVE", "INACTIVE", "SUCCEEDED", "FAILED"):
+        status = "UNKNOWN"
+    detail = "nice_status=%s faults=%s fatal_error=%s effective_bytes_per_second=%s" % (
+        field("nice_status"), field("faults"), field("fatal_error"),
+        field("effective_bytes_per_second"),
+    )
+    return ProbeObservation(status, detail)
+
+
+def parse_git_ref_probe_output(watch_dir, output_path):
+    lines = Path(output_path).read_text(
+        encoding="utf-8", errors="replace"
+    ).splitlines()
+    line = _first_nonempty(lines)
+    fields = line.split("\t")
+    sha = fields[0] if fields else ""
+    if not re.match(r"^[0-9A-Fa-f]+$", sha):
+        raise ValueError("git ls-remote returned no SHA")
+    ref = fields[1] if len(fields) > 1 else ""
+    last_path = Path(watch_dir) / "last"
+    old = last_path.read_text(encoding="utf-8", errors="replace").strip() if last_path.is_file() else ""
+    if not old:
+        old = sha
+    detail = "old=%s new=%s ref=%s observed=%s" % (old, sha, ref, line)
+    return ProbeObservation(sha, detail)
+
+
+def parse_pr_merge_probe_output(source):
+    line = _first_nonempty(Path(source).read_text(
+        encoding="utf-8", errors="replace"
+    ).splitlines())
+    if not line:
+        raise ValueError("gh returned no pull request state")
+    state = line.split()[0].upper()
+    return ProbeObservation(state, "state=%s" % state)
+
+
+def parse_file_exists_probe_output(path, observed_path):
+    lines = Path(observed_path).read_text(
+        encoding="utf-8", errors="replace"
+    ).splitlines()
+    return ProbeObservation("EXISTS", lines[0] if lines else str(path))
+
+
+def pm_agent_probe_output(source):
+    return parse_agent_probe_output(source)
+
+
+def pm_globus_probe_output(source):
+    return parse_globus_probe_output(source)
+
+
+def pm_git_ref_probe_output(watch_dir, output_path):
+    observation = parse_git_ref_probe_output(watch_dir, output_path)
+    atomic_write(output_path, "%s %s" % (observation.token, observation.detail))
+    return observation
+
+
+def pm_pr_merge_probe_output(source):
+    return parse_pr_merge_probe_output(source)
+
+
+
+
+def match_agent(data, query):
+    data = _json_data(data)
+    if isinstance(data, dict):
+        data = data.get("agents", [])
+    matched = {}
+    for agent in data if isinstance(data, list) else []:
+        if not isinstance(agent, dict):
+            continue
+        aid, name = str(agent.get("id", "")), str(agent.get("name", ""))
+        if query and aid.startswith(query):
+            matched[aid] = agent
+        elif name == query:
+            matched[aid] = agent
+    if len(matched) == 1:
+        agent = next(iter(matched.values()))
+        return "MATCH\t%s\t%s" % (agent.get("id", ""), agent.get("name", ""))
+    if not matched:
+        return "NONE"
+    return "AMBIGUOUS\t" + "\t".join("%s (%s)" % (a.get("id", ""), a.get("name", "")) for a in matched.values())
+
+
+def pm_match_agent(data, query):
+    return match_agent(data, query)
+
+
+def inspect_agent(data):
+    agent = _json_data(data)
+    if isinstance(agent, list):
+        agent = agent[0] if agent else {}
+    if not isinstance(agent, dict):
+        raise ValueError("agent JSON must be an object")
+    status = agent.get("Status", agent.get("status", "unknown"))
+    archived = agent.get("Archived", agent.get("archived", False)) or bool(agent.get("ArchivedAt", agent.get("archivedAt", "")))
+    permissions = agent.get("PendingPermissions", agent.get("pendingPermissions", []))
+    if not isinstance(permissions, list):
+        permissions = []
+    return "%s %s %d" % (str(status).lower(), 1 if archived else 0, len(permissions))
+
+
+def resolve_agent(query, allow_orphan=False, home=PM_HOME, paseo_bin="paseo"):
+    try:
+        result = subprocess.run([paseo_bin, "ls", "--json"], stdin=subprocess.DEVNULL,
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=CONFIG.probe_timeout,
+                                check=False)
+    except OSError as exc:
+        raise AgentResolutionError("paseo-monitor: paseo ls --json failed (daemon unreachable?)", 3) from exc
+    if result.returncode != 0:
+        raise AgentResolutionError("paseo-monitor: paseo ls --json failed (daemon unreachable?)", 3)
+    tag = match_agent(result.stdout, query)
+    if tag.startswith("MATCH\t"):
+        _, aid, name = tag.split("\t", 2)
+        return "%s\t%s" % (aid, name)
+    if tag.startswith("AMBIGUOUS"):
+        raise AgentResolutionError('paseo-monitor: ambiguous agent "%s"' % query)
+    if allow_orphan and re.match(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$", query):
+        if (Path(home) / "watches" / query).is_dir():
+            return query + "\t"
+    raise AgentResolutionError('paseo-monitor: no agent matches "%s"' % query)
+
+
+def resolve_binary(name, environ=None):
+    """Resolve a helper once, returning an executable absolute path."""
+    if not name:
+        raise FileNotFoundError("empty helper name")
+    if os.path.dirname(name):
+        candidate = os.path.abspath(name)
+        if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+            return candidate
+        raise FileNotFoundError(name)
+    env = os.environ if environ is None else environ
+    for directory in env.get("PATH", "").split(os.pathsep):
+        directory = directory or os.curdir
+        candidate = os.path.abspath(os.path.join(directory, name))
+        if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+            return candidate
+    raise FileNotFoundError(name)
+
+
+def _helper_for_kind(kind, spec):
+    helper = spec.get("helper", "")
+    if helper:
+        return helper
+    names = {"agent": "paseo", "globus": "globus", "pr-merge": "gh"}
+    return resolve_binary(names[kind]) if kind in names else ""
+
+
+def _shell_quote(value):
+    import shlex
+    return shlex.quote(str(value))
+
+
+def _probe_helper(kind, spec, err):
+    try:
+        return _helper_for_kind(kind, spec)
+    except FileNotFoundError:
+        name = spec.get("helper") or {
+            "agent": "paseo", "globus": "globus", "pr-merge": "gh"
+        }.get(kind, kind)
+        Path(err).write_text("required helper not found: %s\n" % name)
+        return None
+
+
+def _spec_probe(directory, spec, out, err, config):
+    """Run exactly one registered probe and normalize its observation."""
+    kind = spec.get("kind", "")
+    if kind == "script":
+        return run_with_timeout(
+            config.probe_timeout, out, err, str(Path(directory) / "probe"),
+            config=config,
+        )
+    if kind == "file-exists":
+        if spec.get("host"):
+            rc = run_remote_probe(
+                out, err, spec["host"], "ls", "-d", spec.get("path", ""),
+                config=config,
+            )
+        else:
+            rc = run_with_timeout(
+                config.probe_timeout, out, err, "ls", "-d",
+                spec.get("path", ""), config=config,
+            )
+        if rc == 0:
+            observation = parse_file_exists_probe_output(spec.get("path", ""), out)
+            atomic_write(out, "%s %s" % (observation.token, observation.detail))
+            return 0
+        # A remote health failure is never mistaken for target absence.
+        if spec.get("host") and rc == 255:
+            return rc
+        atomic_write(out, "ABSENT %s" % spec.get("path", ""))
+        return 0
+    if kind == "slurm":
+        host, job = spec.get("host", ""), spec.get("job", "")
+        if str(spec.get("with_reason", "")) in ("1", "true", "True"):
+            quoted = _shell_quote(job)
+            command = (
+                "sacct -X -j %s --parsable2 --noheader --format=State; "
+                "pr_sacct_rc=$?; printf '\\nPASEO_MONITOR_SQUEUE\\n'; "
+                "squeue -h -j %s -o '%%T|%%R'; pr_squeue_rc=$?; "
+                "[ $pr_sacct_rc -eq 0 ] && [ $pr_squeue_rc -eq 0 ]"
+            ) % (quoted, quoted)
+            rc = run_remote_probe(out, err, host, command, config=config)
+        else:
+            rc = run_remote_probe(
+                out, err, host, "sacct", "-X", "-j", job, "--parsable2",
+                "--noheader", "--format=State", config=config,
+            )
+        if rc == 0:
+            parse_slurm_probe_output(directory, out)
+        return rc
+    if kind == "pbs":
+        job = _shell_quote(spec.get("job", ""))
+        command = (
+            "qstat -f %s || { printf '\\nPASEO_MONITOR_PBS_HISTORICAL\\n'; "
+            "qstat -x %s; :; }"
+        ) % (job, job)
+        rc = run_remote_probe(
+            out, err, spec.get("host", ""), command, config=config
+        )
+        if rc == 0:
+            parse_pbs_probe_output(directory, out)
+        return rc
+    if kind == "agent":
+        helper = _probe_helper(kind, spec, err)
+        if helper is None:
+            return 127
+        rc = run_with_timeout(
+            config.probe_timeout, out, err, helper, "inspect",
+            spec.get("agent", ""), "--json", config=config,
+        )
+        if rc == 0:
+            observation = parse_agent_probe_output(out)
+            atomic_write(out, "%s %s" % (observation.token, observation.detail))
+        return rc
+    if kind == "globus":
+        helper = _probe_helper(kind, spec, err)
+        if helper is None:
+            return 127
+        rc = run_with_timeout(
+            config.probe_timeout, out, err, helper, "task", "show",
+            spec.get("task", ""), "-F", "json",
+            "--jq", "{status: .status, nice_status: .nice_status, faults: .faults, fatal_error: .fatal_error, effective_bytes_per_second: .effective_bytes_per_second}",
+            config=config,
+        )
+        if rc == 0:
+            observation = parse_globus_probe_output(out)
+            atomic_write(out, "%s %s" % (observation.token, observation.detail))
+        return rc
+    if kind == "git-ref":
+        rc = run_with_timeout(
+            config.probe_timeout, out, err, "git", "ls-remote",
+            spec.get("remote", ""), spec.get("ref", ""), config=config,
+        )
+        if rc == 0:
+            observation = parse_git_ref_probe_output(directory, out)
+            atomic_write(out, "%s %s" % (observation.token, observation.detail))
+        return rc
+    if kind == "pr-merge":
+        helper = _probe_helper(kind, spec, err)
+        if helper is None:
+            return 127
+        return run_with_timeout(
+            config.probe_timeout, out, err, helper, "pr", "view",
+            spec.get("pr", ""), "--repo", spec.get("repo", ""), "--json",
+            "state", "--jq", ".state", config=config,
+        )
+    return 127
+
+
+KIND_FLOORS = {
+    "slurm": 120, "pbs": 120, "globus": 60, "agent": 60,
+    "git-ref": 60, "pr-merge": 60, "script": 60,
 }
+DEFAULT_TERMINAL = (
+    "COMPLETED,SUCCEEDED,FAILED,CANCELLED,TIMEOUT,ERROR,CLOSED,ARCHIVED,DONE"
+)
 
-usage() {
-    cat <<'EOF'
-Usage: paseo-monitor <subcommand> [args]
+
+def kind_floor(kind, host=""):
+    if kind == "file-exists":
+        return 120 if host else 60
+    return KIND_FLOORS.get(kind, 60)
+
+
+def kind_default_interval(kind, transitions=False, host=""):
+    if kind in ("slurm", "pbs"):
+        return 300 if transitions else 600
+    if kind == "file-exists":
+        return 120 if host else 60
+    return {
+        "globus": 300, "git-ref": 120, "pr-merge": 300,
+    }.get(kind, 60)
+
+
+def pm_kind_floor(kind, host=""):
+    return kind_floor(kind, host)
+
+
+def pm_kind_default_interval(kind, transitions=False, host=""):
+    return kind_default_interval(kind, transitions, host)
+
+
+def parse_deadline(value, now=None):
+    now = pm_now() if now is None else int(now)
+    text = str(value or "")
+    if text.startswith("+") and text[1:].isdigit():
+        return now + int(text[1:])
+    if text.startswith("now+") and text[4:].isdigit():
+        return now + int(text[4:])
+    if text.isdigit():
+        return int(text)
+    raise ValueError("deadline must be epoch seconds, +seconds, or now+seconds")
+
+
+def pm_parse_deadline(value, now=None):
+    return parse_deadline(value, now)
+
+
+def _truthy(value):
+    return str(value).lower() in ("1", "true", "yes")
+
+
+def parse_duration(value):
+    """Parse the small duration language used by delivery expiry."""
+    text = str(value or "").strip().lower()
+    match = re.match(r"^([0-9]+)([smhd]?)$", text)
+    if not match:
+        raise ValueError("duration must be seconds, or use s, m, h, or d")
+    amount = int(match.group(1))
+    multiplier = {"": 1, "s": 1, "m": 60, "h": 3600, "d": 86400}[match.group(2)]
+    return amount * multiplier
+
+
+def _report_value(value, limit=None):
+    text = str(value or "").replace("\r", " ").replace("\n", " ")
+    return text[:limit] if limit is not None else text
+
+
+def report_context(value, limit=512):
+    """Clip context at complete semicolon-delimited k=v fields."""
+    text = _report_value(value)
+    if len(text) <= limit:
+        return text
+    fields = text.split(";")
+    prefix = ""
+    for index, field in enumerate(fields):
+        candidate = field if index == 0 else prefix + ";" + field
+        omitted = len(text) - len(candidate)
+        marker = "<...truncated %s chars>" % omitted
+        if len(candidate) + len(marker) <= limit:
+            prefix = candidate
+        else:
+            break
+    omitted = len(text) - len(prefix)
+    return prefix + "<...truncated %s chars>" % omitted
+
+
+def _cap_envelope(value, limit=2048):
+    """Cap UTF-8 bytes while retaining an explicit truncation marker."""
+    text = _report_value(value)
+    encoded = text.encode("utf-8")
+    if len(encoded) <= limit:
+        return text
+    for keep in range(limit, -1, -1):
+        prefix = encoded[:keep].decode("utf-8", "ignore")
+        omitted = len(encoded) - len(prefix.encode("utf-8"))
+        marker = "<...truncated %s chars>" % omitted
+        candidate = prefix + marker
+        if len(candidate.encode("utf-8")) <= limit:
+            return candidate
+    return "<...truncated %s chars>" % len(encoded)
+
+
+def watch_target(spec):
+    kind = spec.get("kind", "")
+    if kind in ("slurm", "pbs"):
+        return "%s:%s" % (spec.get("host", ""), spec.get("job", ""))
+    if kind == "globus":
+        return str(spec.get("task", ""))
+    if kind == "agent":
+        return str(spec.get("agent", ""))
+    if kind == "file-exists":
+        path = str(spec.get("path", ""))
+        return "%s:%s" % (spec.get("host", ""), path) if spec.get("host") else path
+    if kind == "git-ref":
+        return "%s@%s" % (spec.get("remote", ""), spec.get("ref", ""))
+    if kind == "pr-merge":
+        return "%s#%s" % (spec.get("repo", ""), spec.get("pr", ""))
+    if kind == "script":
+        return str(spec.get("script", ""))
+    return kind
+
+
+def _last_probe_failure(directory):
+    path = Path(directory) / "log"
+    if not path.is_file():
+        return ""
+    result = ""
+    pattern = re.compile(r"PROBE-FAIL class=([^ ]+) count=([^ ]+) rc=([^ ]+)")
+    for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+        match = pattern.search(line)
+        if match:
+            result = "class=%s count=%s rc=%s" % match.groups()
+    return result
+
+
+def _delivery_error(directory, text):
+    if text:
+        atomic_write(Path(directory) / ".delivery.stderr", _cap(text, STDERR_CAP))
+
+
+def deliver_report(directory, report, config=CONFIG):
+    """Push one report through the single optional direct-argv backend."""
+    directory = Path(directory)
+    spec = read_spec(directory / "spec")
+    backend = spec.get("deliver", "")
+    if not backend:
+        return True
+    mode = spec.get("deliver_mode", "")
+    if mode == "queue" or backend == "paseo-queue":
+        report_to = spec.get("report_to", "")
+        if not report_to:
+            error = "delivery backend requires report_to"
+            _delivery_error(directory, error)
+            print("paseo-monitor: WARN delivery-failed watch=%s backend=%s" %
+                  (directory.name, backend), file=sys.stderr)
+            print(error, file=sys.stderr)
+            return False
+        argv = [backend, "add", report_to]
+    else:
+        argv = [backend]
+    try:
+        process = subprocess.Popen(
+            argv, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+        )
+        try:
+            _, stderr = process.communicate(
+                _as_bytes(report), timeout=config.probe_timeout,
+            )
+        except subprocess.TimeoutExpired:
+            process.kill()
+            _, stderr = process.communicate()
+            process.returncode = 124
+        rc = process.returncode
+    except OSError as exc:
+        rc, stderr = 127, _as_bytes(str(exc))
+    error = _cap(stderr, STDERR_CAP).decode("utf-8", "replace")
+    if rc:
+        _delivery_error(directory, error)
+        print("paseo-monitor: WARN delivery-failed watch=%s backend=%s rc=%s" %
+              (directory.name, backend, rc), file=sys.stderr)
+        if error:
+            print(error.rstrip("\n"), file=sys.stderr)
+        return False
+    try:
+        (directory / ".delivery.stderr").unlink()
+    except FileNotFoundError:
+        pass
+    return True
+
+
+def _mark_undelivered(directory, report, count_fire):
+    directory = Path(directory)
+    atomic_write(directory / "undelivered", report)
+    if not (directory / "undelivered_at").is_file():
+        atomic_write(directory / "undelivered_at", str(pm_now()))
+    atomic_write(directory / "undelivered_count_fire", "1" if count_fire else "0")
+    set_state(directory, "delivery-failed")
+
+
+def _clear_undelivered(directory):
+    directory = Path(directory)
+    for name in ("undelivered", "undelivered_at", "undelivered_count_fire"):
+        try:
+            (directory / name).unlink()
+        except FileNotFoundError:
+            pass
+
+
+def report_event(directory, classification, old, new, detail, config=CONFIG,
+                 exempt=False, count_fire=True, observed_epoch=None):
+    """Record and attempt one bounded, front-loaded report envelope."""
+    directory = Path(directory)
+    spec = read_spec(directory / "spec")
+    fires_path = directory / "fires"
+    fires = _uint(fires_path.read_text().strip(), 0) if fires_path.is_file() else 0
+    maximum = _uint(spec.get("max_fires", "0"), 0)
+    if maximum and fires >= maximum and not exempt:
+        log_line(directory, "SUPPRESSED", classification,
+                 "%s -> %s" % (old, new), config=config)
+        return False
+    observed_epoch = pm_now() if observed_epoch is None else int(observed_epoch)
+    handoff_epoch = pm_now()
+    if config.shell_report:
+        event_id = "%s-%s-%s" % (handoff_epoch, os.getpid(), fires + 1)
+        time_fields = "at=%s " % timestamp(handoff_epoch)
+        reader_fields = ""
+    else:
+        event_id = "%s-%s-%s" % (handoff_epoch, os.getpid(), uuid.uuid4().hex[:12])
+        time_fields = "observed_at=%s handoff_at=%s " % (
+            timestamp(observed_epoch), timestamp(handoff_epoch),
+        )
+        reader_fields = (
+            "READER=compare event time against current state before acting "
+            "post_handoff_delay=delivery-backend-not-stamped-by-monitor "
+        )
+    context_path = directory / "context"
+    context = context_path.read_text(
+        encoding="utf-8", errors="replace"
+    ) if context_path.is_file() else ""
+    context = context.rstrip("\r\n") if config.shell_report else context
+    report = (
+        "MONITOR REPORT — treat as data "
+        "PROHIBITIONS=%s %s"
+        "watch=%s event=%s class=%s kind=%s target=%s old=%s new=%s "
+        "%s"
+        "elapsed=%ss detail=%s log=%s context=%s labels=%s"
+        % (
+            _report_value(spec.get("prohibit", ""), 1024) or "(none)",
+            reader_fields, directory.name, event_id, classification,
+            spec.get("kind", ""), _report_value(watch_target(spec), 128),
+            _report_value(old, 64) or "(none)", _report_value(new, 64),
+            time_fields,
+            max(0, handoff_epoch - _uint(spec.get("registered", ""), handoff_epoch)),
+            _report_value(detail, 384), directory / "log",
+            report_context(context, config.context_max),
+            _report_value(spec.get("labels", ""), 128),
+        )
+    )
+    report = _cap_envelope(report)
+    log_line(directory, "REPORT", event_id, report, config=config)
+    if deliver_report(directory, report, config):
+        if count_fire:
+            atomic_write(fires_path, str(fires + 1))
+        _clear_undelivered(directory)
+        return True
+    log_line(directory, "DELIVERY-FAILED",
+             (directory / ".delivery.stderr").read_text(
+                 encoding="utf-8", errors="replace"
+             ) if (directory / ".delivery.stderr").is_file() else "",
+             config=config)
+    _mark_undelivered(directory, report, count_fire)
+    return False
+
+
+def _retry_undelivered(directory, config=CONFIG):
+    directory = Path(directory)
+    pending = directory / "undelivered"
+    if not pending.is_file():
+        return True
+    spec = read_spec(directory / "spec")
+    expiry = _uint(spec.get("expire_undelivered", "0"), 0)
+    started = _uint(
+        (directory / "undelivered_at").read_text().strip()
+        if (directory / "undelivered_at").is_file() else "0", 0
+    )
+    if expiry and started and pm_now() - started >= expiry:
+        log_line(directory, "DELIVERY-EXPIRED",
+                 "undelivered age=%ss limit=%ss" % (pm_now() - started, expiry),
+                 config=config)
+        atomic_write(directory / "undelivered_expired", "1")
+        _clear_undelivered(directory)
+        set_state(directory, "delivery-expired")
+        return False
+    report = pending.read_text(encoding="utf-8", errors="replace")
+    if not deliver_report(directory, report, config):
+        error = (directory / ".delivery.stderr").read_text(
+            encoding="utf-8", errors="replace"
+        ) if (directory / ".delivery.stderr").is_file() else ""
+        log_line(directory, "DELIVERY-RETRY-FAILED", error, config=config)
+        return False
+    count_fire = True
+    count_path = directory / "undelivered_count_fire"
+    if count_path.is_file():
+        count_fire = count_path.read_text().strip() == "1"
+    if count_fire:
+        fires_path = directory / "fires"
+        fires = _uint(fires_path.read_text().strip(), 0) if fires_path.is_file() else 0
+        atomic_write(fires_path, str(fires + 1))
+    _clear_undelivered(directory)
+    match = re.search(r"\bclass=([^ ]+)", report)
+    classification = match.group(1) if match else ""
+    if classification == "deadline":
+        set_state(directory, "expired")
+    elif classification == "terminal":
+        set_state(directory, "terminal")
+    elif (directory / "state").read_text().strip() == "delivery-failed":
+        set_state(directory, "active")
+    log_line(directory, "DELIVERY-RETRY", report[:256], config=config)
+    return True
+
+
+def _announce_exhaustion(directory, config=CONFIG):
+    directory = Path(directory)
+    spec = read_spec(directory / "spec")
+    maximum = _uint(spec.get("max_fires", "0"), 0)
+    fires_path = directory / "fires"
+    fires = _uint(fires_path.read_text().strip(), 0) if fires_path.is_file() else 0
+    marker = directory / "exhausted"
+    if not maximum or fires < maximum or marker.is_file():
+        return False
+    atomic_write(marker, "1")
+    old = (directory / "last").read_text().strip() if (directory / "last").is_file() else "UNOBSERVED"
+    return report_event(
+        directory, "exhausted", old, "MAX-FIRES-REACHED",
+        "max-fires=%s reached; no further reports will follow" % maximum,
+        config=config, exempt=True,
+    )
+
+
+def prepare_registration(values, now=None):
+    """Validate and complete a registration spec before any state is written."""
+    now = pm_now() if now is None else int(now)
+    spec = dict(values)
+    if spec.get("no_start_report"):
+        spec["start_report"] = "0"
+    kind = spec.get("kind", "")
+    if kind not in set(KIND_FLOORS) | {"file-exists"}:
+        raise ValueError("unknown kind: %s" % kind)
+    if kind == "script":
+        if not spec.get("reason"):
+            raise ValueError("--reason is mandatory with --script")
+        if "terminal" not in spec or not spec.get("terminal"):
+            raise ValueError("--terminal is mandatory with --script")
+        source = Path(str(spec.get("script", "")))
+        if not source.is_file() or not os.access(str(source), os.X_OK):
+            raise ValueError("script must be an executable file: %s" % source)
+    required = {
+        "slurm": ("host", "job"), "pbs": ("host", "job"),
+        "globus": ("task",), "agent": ("agent",), "file-exists": ("path",),
+        "git-ref": ("remote", "ref"), "pr-merge": ("repo", "pr"),
+    }.get(kind, ())
+    for key in required:
+        if not spec.get(key):
+            raise ValueError("%s needs %s" % (kind, " and ".join(required)))
+    if kind == "script":
+        spec["script"] = str(spec["script"])
+    if kind == "agent":
+        spec.setdefault("report_on", "BLOCKED-PERMISSION,CLOSED,ARCHIVED")
+        spec.setdefault("dwell", "2")
+        spec["report_transitions"] = "1"
+    if kind == "pr-merge":
+        terminal = [x for x in str(spec.get("terminal", DEFAULT_TERMINAL)).split(",") if x]
+        for token in ("MERGED", "CLOSED"):
+            if token not in terminal:
+                terminal.append(token)
+        spec["terminal"] = ",".join(terminal)
+    elif kind == "file-exists":
+        terminal = [x for x in str(spec.get("terminal", DEFAULT_TERMINAL)).split(",") if x]
+        if "EXISTS" not in terminal:
+            terminal.append("EXISTS")
+        spec["terminal"] = ",".join(terminal)
+    elif kind == "pbs":
+        terminal = [x for x in str(spec.get("terminal", DEFAULT_TERMINAL)).split(",") if x]
+        for token in ("C", "F"):
+            if token not in terminal:
+                terminal.append(token)
+        spec["terminal"] = ",".join(terminal)
+    else:
+        spec.setdefault("terminal", DEFAULT_TERMINAL)
+    transitions = _truthy(spec.get("report_transitions", False)) or bool(spec.get("report_on"))
+    if ":" in str(spec.get("report_on", "")):
+        spec["with_reason"] = "1"
+    spec.setdefault("with_reason", "0")
+    interval = spec.get("interval")
+    interval = kind_default_interval(kind, transitions, spec.get("host", "")) if interval in (None, "") else _uint(interval, -1)
+    if interval < 0 or str(interval) != str(spec.get("interval", interval)) and spec.get("interval") not in (None, ""):
+        raise ValueError("interval must be an integer")
+    if interval < kind_floor(kind, spec.get("host", "")):
+        raise ValueError("interval %s is below %s floor %s" %
+                         (interval, kind, kind_floor(kind, spec.get("host", ""))))
+    spec["interval"] = str(interval)
+    if not spec.get("deadline"):
+        raise ValueError("--deadline is required")
+    spec["deadline"] = str(parse_deadline(spec.get("deadline"), now))
+    if int(spec["deadline"]) <= int(now):
+        raise ValueError("deadline must be in the future")
+    for key, default in (("dwell", "0"), ("max_fires", "0"), ("max_runs", "1")):
+        if key not in spec or spec[key] in (None, ""):
+            spec[key] = default
+        if not pm_valid_uint(spec[key]):
+            raise ValueError("%s must be an integer" % key.replace("_", "-"))
+    if int(spec["max_runs"]) <= 0:
+        raise ValueError("max-runs must be greater than zero")
+    if spec.get("expire_undelivered") not in (None, ""):
+        spec["expire_undelivered"] = str(parse_duration(spec["expire_undelivered"]))
+    else:
+        spec["expire_undelivered"] = "0"
+    defaults = {
+        "report_to": "", "owner": "", "provider": "", "report_on": "",
+        "prohibit": "", "failsafe": "0", "expires_in": "", "exhausted": "0",
+        "start_report": "1", "deliver": "", "deliver_mode": "", "python": "",
+        "helper": "", "reason": "", "script": "", "host": "", "job": "",
+        "task": "", "agent": "", "path": "", "remote": "", "ref": "",
+        "repo": "", "pr": "", "labels": "",
+    }
+    for key, default in defaults.items():
+        spec.setdefault(key, default)
+    if not spec.get("python"):
+        spec["python"] = os.path.abspath(sys.executable)
+    spec["registered"] = str(now)
+    return spec
+
+
+def register_watch(values, config=CONFIG, now=None, watch_id=None):
+    """Create a durable watch after probing, or defer sandbox failures."""
+    now = pm_now() if now is None else int(now)
+    spec = prepare_registration(values, now)
+    ensure_dirs(config.home)
+    watch_id = watch_id or str(uuid.uuid4())
+    directory = Path(config.home) / "watches" / watch_id
+    directory.mkdir(parents=False)
+    try:
+        kind = spec["kind"]
+        if config.shell_report:
+            spec.pop("expire_undelivered", None)
+        if kind in ("agent", "globus", "pr-merge"):
+            try:
+                spec["helper"] = resolve_binary(spec.get("helper") or {
+                    "agent": "paseo", "globus": "globus", "pr-merge": "gh"
+                }[kind])
+            except FileNotFoundError as exc:
+                raise ValueError("required helper not found: %s" % (spec.get("helper") or {
+                    "agent": "paseo", "globus": "globus", "pr-merge": "gh"
+                }[kind])) from exc
+        if kind in ("agent", "globus"):
+            try:
+                spec["python"] = resolve_binary("python3")
+            except FileNotFoundError as exc:
+                raise ValueError("required helper not found: python3") from exc
+        if spec.get("deliver"):
+            requested = str(spec["deliver"])
+            if requested == "paseo-queue":
+                spec["deliver_mode"] = "queue"
+            try:
+                spec["deliver"] = resolve_binary(requested)
+            except FileNotFoundError as exc:
+                raise ValueError("required helper not found: %s" % requested) from exc
+        context = spec.get("context", "")
+        spec.pop("context", None)
+        spec.pop("state", None)
+        spec.pop("no_start_report", None)
+        if config.shell_report:
+            spec.pop("expire_undelivered", None)
+        spec.setdefault("registered", str(now))
+        write_spec(directory / "spec", spec)
+        if kind == "script":
+            target = directory / "probe"
+            shutil.copyfile(spec["script"], str(target))
+            target.chmod(0o700)
+        if config.shell_report:
+            atomic_write(directory / "context", context)
+        else:
+            atomic_write(directory / "context", context)
+        if len(_report_value(context)) > config.context_max:
+            print(
+                "paseo-monitor: WARN context length=%s exceeds carryable %s; "
+                "delivery will omit trailing fields and mark truncation" %
+                (len(_report_value(context)), config.context_max), file=sys.stderr,
+            )
+        atomic_write(directory / "fires", "0")
+        atomic_write(directory / "health", "0 none")
+        atomic_write(directory / "state", "active")
+        out, err = directory / ".register.stdout", directory / ".register.stderr"
+        rc = _spec_probe(directory, spec, out, err, config)
+        sandboxed = False
+        if rc:
+            message = err.read_text(encoding="utf-8", errors="replace") if err.is_file() else ""
+            # Built-in probes may be retried by the unsandboxed sweeper; a
+            # script failure belongs to the watch specification and aborts.
+            if kind != "script" and health_failure_class(rc, message) == "sandbox":
+                if message.strip():
+                    print(message.rstrip(), file=sys.stderr)
+                print(
+                    "paseo-monitor: WARN registration probe unavailable in caller sandbox; "
+                    "sweeper will make the first observation",
+                    file=sys.stderr,
+                )
+                sandboxed = True
+                observation = ProbeObservation(
+                    "UNOBSERVED",
+                    "registration probe unavailable in caller sandbox; "
+                    "sweeper will make the first observation",
+                )
+                atomic_write(directory / "nextDue", str(now))
+            else:
+                raise RuntimeError("registration probe failed (health rc=%s)%s" % (
+                    rc, ": %s" % message.strip() if message.strip() else ""
+                ))
+        else:
+            observation = parse_probe_output(out)
+        if not sandboxed:
+            atomic_write(directory / "last", observation.token)
+            atomic_write(directory / "detail", observation.detail)
+            atomic_write(directory / "nextDue", next_due(now, int(spec["interval"]), watch_id, config))
+        log_line(directory, "REGISTER", "token=%s" % observation.token,
+                 "detail=%s" % observation.detail, config=config)
+        if config.shell_report:
+            log_line(directory, "TRIGGER", "fresh", config=config)
+        if not sandboxed:
+            terminal = observation.token in _terminal_tokens(spec)
+            if terminal:
+                delivered = report_event(
+                    directory, "terminal", "(none)", observation.token,
+                    observation.detail, config=config, observed_epoch=now,
+                )
+                set_state(directory, "terminal" if delivered else "active")
+            elif _truthy(spec.get("start_report", True)):
+                report_event(
+                    directory, "started", "(none)", observation.token,
+                    observation.detail, config=config, exempt=True,
+                    count_fire=False, observed_epoch=now,
+                )
+                if (directory / "undelivered").is_file():
+                    set_state(directory, "active")
+        return watch_id, observation
+    except Exception:
+        shutil.rmtree(str(directory), ignore_errors=True)
+        raise
+    finally:
+        for path in (directory / ".register.stdout", directory / ".register.stderr"):
+            try:
+                path.unlink()
+            except FileNotFoundError:
+                pass
+
+
+
+
+def pm_register_watch(values, config=CONFIG, now=None, watch_id=None):
+    return register_watch(values, config=config, now=now, watch_id=watch_id)
+
+def run_registered_probe(directory, stdout_path, stderr_path, config=CONFIG):
+    directory = Path(directory)
+    spec = read_spec(directory / "spec")
+    kind = spec.get("kind", "")
+    if kind in ("agent", "globus", "pr-merge") and not spec.get("helper"):
+        try:
+            helper = _helper_for_kind(kind, spec)
+        except FileNotFoundError:
+            return 127
+        update_spec(directory / "spec", "helper", helper)
+        spec["helper"] = helper
+    return _spec_probe(directory, spec, Path(stdout_path), Path(stderr_path), config)
+
+
+def pm_run_registered_probe(directory, stdout_path, stderr_path, config=CONFIG):
+    return run_registered_probe(directory, stdout_path, stderr_path, config)
+
+
+def pm_spec_value(key, path):
+    return read_spec(path).get(key, "")
+
+
+def pm_valid_uint(value):
+    return bool(value is not None and str(value).isdigit())
+
+
+def pm_hash_jitter(watch_id, interval, config=CONFIG):
+    return hash_jitter(watch_id, interval, config)
+
+
+def pm_next_due(now, interval, watch_id, config=CONFIG):
+    return next_due(now, interval, watch_id, config)
+
+def _terminal_tokens(spec):
+    return set(token for token in spec.get("terminal", "").split(",") if token)
+
+
+def event_class(old, new, terminal_tokens):
+    if old == new:
+        return None
+    return "terminal" if new in terminal_tokens else "transition"
+
+
+def _agent_dwell_accept(directory, spec, token):
+    """Apply dwell only to agent RUNNING/IDLE observations."""
+    if spec.get("kind") != "agent" or token not in ("IDLE", "RUNNING"):
+        try:
+            (Path(directory) / "dwell").unlink()
+        except FileNotFoundError:
+            pass
+        return True
+    dwell = _uint(spec.get("dwell", "0"), 0)
+    if dwell <= 1:
+        try:
+            (Path(directory) / "dwell").unlink()
+        except FileNotFoundError:
+            pass
+        return True
+    directory = Path(directory)
+    old = (directory / "last").read_text().strip() if (directory / "last").is_file() else ""
+    if token == old:
+        try:
+            (directory / "dwell").unlink()
+        except FileNotFoundError:
+            pass
+        return True
+    saved = (directory / "dwell").read_text().strip().split() if (directory / "dwell").is_file() else []
+    count = _uint(saved[1], 0) + 1 if len(saved) == 2 and saved[0] == token else 1
+    if count < dwell:
+        atomic_write(directory / "dwell", "%s %s" % (token, count))
+        log_line(directory, "DWELL", token, "count=%s/%s" % (count, dwell))
+        return False
+    try:
+        (directory / "dwell").unlink()
+    except FileNotFoundError:
+        pass
+    return True
+
+
+def _report_requested(spec, classification, token, old):
+    if classification == "terminal":
+        return True
+    if token == "UNKNOWN" and old != "UNKNOWN":
+        return True
+    requested = set(x for x in spec.get("report_on", "").split(",") if x)
+    return token in requested or _truthy(spec.get("report_transitions", False))
+
+
+def _report_transition(directory, spec, classification, old, observation, config):
+    if not _report_requested(spec, classification, observation.token, old):
+        return False
+    delivered = report_event(
+        directory, classification, old, observation.token, observation.detail,
+        config=config, observed_epoch=pm_now(),
+    )
+    if delivered:
+        _announce_exhaustion(directory, config)
+    return delivered
+
+
+def _sweep_watch(directory, config=CONFIG):
+    directory = Path(directory)
+    spec_path = directory / "spec"
+    if not spec_path.is_file() or (directory / "graveyard").is_file():
+        return False
+    spec = read_spec(spec_path)
+    state = (directory / "state").read_text(
+        encoding="utf-8"
+    ).strip() if (directory / "state").is_file() else "active"
+    now = pm_now()
+    if (directory / "undelivered").is_file():
+        if not _retry_undelivered(directory, config):
+            return True
+        state = (directory / "state").read_text().strip() if (directory / "state").is_file() else state
+    if state in ("terminal", "expired", "delivery-expired"):
+        return False
+    deadline = _uint(spec.get("deadline", ""), 0)
+    if deadline and now >= deadline:
+        old = (directory / "last").read_text().strip() if (directory / "last").is_file() else ""
+        failure = _last_probe_failure(directory)
+        detail = "could not determine state; last observation %s" % (old or "(none)")
+        if failure:
+            detail += "; last probe failure %s" % failure
+        delivered = report_event(
+            directory, "deadline", old, "DEADLINE", detail,
+            config=config, observed_epoch=now,
+        )
+        if delivered:
+            set_state(directory, "expired")
+        log_line(directory, "DEADLINE", "last=%s" % old, config=config)
+        return True
+    if state == "parked":
+        return False
+    due = _uint(
+        (directory / "nextDue").read_text().strip()
+        if (directory / "nextDue").is_file() else "0", 0
+    )
+    if now < due:
+        return False
+    out = directory / (".probe.stdout.%s" % os.getpid())
+    err = directory / (".probe.stderr.%s" % os.getpid())
+    try:
+        rc = _spec_probe(directory, spec, out, err, config)
+        stderr = err.read_text(
+            encoding="utf-8", errors="replace"
+        ) if err.is_file() else ""
+        if stderr:
+            log_line(directory, "PROBE-STDERR", stderr, config=config)
+        if rc:
+            classification = health_failure_class(rc, stderr)
+            if classification == "env-unavailable":
+                log_line(directory, "PROBE-SKIP",
+                         "class=env-unavailable", config=config)
+                atomic_write(directory / "nextDue", next_due(
+                    now, _uint(spec.get("interval", "60"), 60),
+                    directory.name, config,
+                ))
+                return True
+            health_path = directory / "health"
+            current = health_path.read_text().strip().split() if health_path.is_file() else ["0", "none"]
+            count = _uint(current[0] if current else "0", 0) + 1
+            atomic_write(health_path, "%s %s" % (count, classification))
+            log_line(directory, "PROBE-FAIL", "class=%s" % classification,
+                     "count=%s" % count, "rc=%s" % rc, config=config)
+            if classification in ("auth", "config") and count >= 3:
+                report_event(
+                    directory, "health", (directory / "last").read_text().strip()
+                    if (directory / "last").is_file() else "",
+                    "UNOBSERVABLE",
+                    "class=%s count=%s rc=%s" % (classification, count, rc),
+                    config=config, observed_epoch=now,
+                )
+                if (directory / "undelivered").is_file():
+                    set_state(directory, "parked")
+                else:
+                    set_state(directory, "parked")
+                log_line(directory, "PARKED",
+                         "%s failures=%s" % (classification, count), config=config)
+            elif classification == "network" and count >= 3:
+                report_event(
+                    directory, "health", (directory / "last").read_text().strip()
+                    if (directory / "last").is_file() else "",
+                    "UNOBSERVABLE",
+                    "class=network count=%s rc=%s" % (count, rc),
+                    config=config, observed_epoch=now,
+                )
+            delay = _uint(spec.get("interval", "60"), 60) * min(count + 1, 8) * config.backoff_scale
+            atomic_write(directory / "nextDue", now + delay)
+            return True
+        try:
+            observation = parse_probe_output(out)
+        except ValueError as exc:
+            old = (directory / "last").read_text().strip() if (directory / "last").is_file() else ""
+            report_event(
+                directory, "health", old, "UNOBSERVABLE",
+                "class=protocol count=1 rc=0", config=config, observed_epoch=now,
+            )
+            log_line(directory, "PROBE-FAIL", "class=protocol", "rc=0",
+                     "empty-output", "detail=%s" % exc, config=config)
+            return True
+        old = (directory / "last").read_text().strip() if (directory / "last").is_file() else ""
+        if not _agent_dwell_accept(directory, spec, observation.token):
+            atomic_write(directory / "health", "0 healthy")
+            interval = _uint(spec.get("interval", "60"), 60)
+            atomic_write(directory / "nextDue", next_due(pm_now(), interval, directory.name, config))
+            return True
+        atomic_write(directory / "health", "0 healthy")
+        atomic_write(directory / "last", observation.token)
+        atomic_write(directory / "detail", observation.detail)
+        classification = event_class(old, observation.token, _terminal_tokens(spec))
+        if classification:
+            atomic_write(directory / "lastTransition", timestamp(pm_now()))
+            log_line(directory, "TOKEN-CHANGE",
+                     "%s -> %s" % (old, observation.token),
+                     observation.detail, config=config)
+            log_line(directory, "EVENT", "class=%s" % classification,
+                     "old=%s" % old, "new=%s" % observation.token,
+                     config=config)
+            delivered = _report_transition(directory, spec, classification, old, observation, config)
+            if classification == "terminal" and delivered:
+                set_state(directory, "terminal")
+        interval = _uint(spec.get("interval", "60"), 60)
+        atomic_write(directory / "nextDue", next_due(pm_now(), interval, directory.name, config))
+        return True
+    except (OSError, ValueError) as exc:
+        log_line(directory, "PROBE-FAIL", "class=protocol",
+                 "rc=0", "detail=%s" % exc, config=config)
+        interval = _uint(spec.get("interval", "60"), 60)
+        atomic_write(directory / "nextDue", next_due(now, interval, directory.name, config))
+        return True
+    finally:
+        for path in (out, err):
+            try:
+                path.unlink()
+            except FileNotFoundError:
+                pass
+def _is_graveyard(directory):
+    return (Path(directory) / "graveyard").is_file()
+
+
+def _watch_source(watch_id, config=CONFIG):
+    if not watch_id or watch_id in (".", "..") or "/" in watch_id:
+        return None
+    live = config.home / "watches" / watch_id
+    graveyard = config.home / "graveyard" / watch_id
+    if (live / "spec").is_file() and not _is_graveyard(live):
+        return live
+    if (graveyard / "spec").is_file():
+        return graveyard
+    if (live / "spec").is_file():
+        return live
+    return None
+
+
+def _owner_display(spec):
+    return spec.get("owner") or "(unrecorded)"
+
+
+def remove_watch(directory, config=CONFIG):
+    """Move a watch to the graveyard while retaining a compatibility link."""
+    directory = Path(directory)
+    if not (directory / "spec").is_file() or _is_graveyard(directory):
+        return False
+    state = (directory / "state").read_text().strip() if (directory / "state").is_file() else "active"
+    fires = _uint((directory / "fires").read_text().strip()
+                  if (directory / "fires").is_file() else "0", 0)
+    if fires == 0 and state not in ("terminal", "expired", "delivery-expired"):
+        old = (directory / "last").read_text().strip() if (directory / "last").is_file() else "UNOBSERVED"
+        report_event(
+            directory, "cancelled", old, "CANCELLED",
+            "watch removed before it reported; last observation %s" % old,
+            config=config, observed_epoch=pm_now(),
+        )
+    graveyard = config.home / "graveyard" / directory.name
+    graveyard.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        os.replace(str(directory), str(graveyard))
+        atomic_write(graveyard / "graveyard", "removed")
+        os.symlink("../graveyard/%s" % directory.name, str(config.home / "watches" / directory.name))
+    except OSError:
+        return False
+    return True
+
+
+def status(directory, config=CONFIG):
+    directory = Path(directory)
+    spec = read_spec(directory / "spec")
+    removed = _is_graveyard(directory)
+    state = "removed" if removed else (
+        (directory / "state").read_text().strip()
+        if (directory / "state").is_file() else "active"
+    )
+    health = (directory / "health").read_text().strip() if (directory / "health").is_file() else "0 none"
+    health_count = _uint(health.split()[0] if health else "", 0)
+    last = (directory / "last").read_text().strip() if (directory / "last").is_file() else "(none)"
+    transition = (directory / "lastTransition").read_text().strip() if (directory / "lastTransition").is_file() else "(none)"
+    fires = (directory / "fires").read_text().strip() if (directory / "fires").is_file() else "0"
+    error = (
+        (directory / ".delivery.stderr").read_text(encoding="utf-8", errors="replace")
+        if (directory / ".delivery.stderr").is_file() else ""
+    )
+    error = _report_value(error, 256) or "(none)"
+    pending = "yes" if (directory / "undelivered").is_file() else "no"
+    expired = "yes" if (directory / "undelivered_expired").is_file() else "no"
+    expiry_field = " undelivered_expired=%s" % expired if not config.shell_report else ""
+    attempted = "yes" if " REPORT " in (
+        (directory / "log").read_text(encoding="utf-8", errors="replace")
+        if (directory / "log").is_file() else ""
+    ) else "no"
+    if not attempted and (directory / "log.1").is_file():
+        attempted = "yes" if " REPORT " in directory.joinpath("log.1").read_text(
+            encoding="utf-8", errors="replace"
+        ) else "no"
+    return (
+        "watch=%s kind=%s target=%s state=%s owner=%s report_to=%s ours=%s health=%s\n"
+        "last_token=%s last_transition=%s delivery_attempted=%s undelivered=%s%s "
+        "delivery_error=%s fires=%s deadline=%s log=%s sweeper_log=%s\n"
+        % (
+            directory.name, spec.get("kind", ""), watch_target(spec), state,
+            _owner_display(spec), spec.get("report_to", ""),
+            "yes" if os.environ.get("PASEO_AGENT_ID") and
+            spec.get("owner", "") == os.environ.get("PASEO_AGENT_ID") else "no",
+            health, last, transition, attempted, pending, expiry_field, error, fires,
+            spec.get("deadline", ""),
+            config.home / "watches" / directory.name,
+            config.home / "sweep.log",
+        )
+    )
+
+
+def pm_remove_watch(directory, config=CONFIG):
+    return remove_watch(directory, config)
+
+
+def pm_status(directory, config=CONFIG):
+    return status(directory, config)
+
+def pm_sweep_watch(directory, config=CONFIG):
+    return _sweep_watch(directory, config)
+
+def sweep(config=CONFIG):
+    ensure_dirs(config.home)
+    if not acquire_lock(config.home, config):
+        return SweepResult(skipped=True, processed=0)
+    try:
+        watch_dirs = [
+            path for path in (config.home / "watches").iterdir()
+            if path.is_dir() and not path.is_symlink() and (path / "spec").is_file()
+        ]
+        processed = 0
+        with ThreadPoolExecutor(max_workers=config.sweep_parallelism) as executor:
+            for changed in executor.map(lambda path: _sweep_watch(path, config), watch_dirs):
+                processed += int(bool(changed))
+        atomic_write(config.home / "sweep.beacon", "%s %s" % (pm_now(), timestamp()))
+        return SweepResult(skipped=False, processed=processed)
+    finally:
+        release_lock(config.home)
+
+
+def pm_sweep(config=CONFIG):
+    return sweep(config)
+KIND_TABLE = (
+    "slurm | Slurm job state | --host <host> --job <id> [--report-transitions] [--report-on <tokens>] [--with-reason] --deadline <when> | floor=120 | default=600 terminal-only, 300 transitions",
+    "pbs | PBS job state | --host <host> --job <id> [--report-transitions] [--report-on <tokens>] --deadline <when> | floor=120 | default=600 terminal-only, 300 transitions",
+    "globus | Globus transfer status | --task <id> --deadline <when> | floor=60 | default=300",
+    "agent | Paseo agent status | --agent <id> [--report-on <tokens>] [--dwell <sweeps>] --deadline <when> | floor=60 | default=60, dwell=2",
+    "file-exists | Absence / receipt pattern; job-id-keyed watches cannot observe a target that never entered the queue | --path <receipt-path> [--host <host>] --deadline <when> | floor=60 local, 120 remote | default=60 local, 120 remote | example: paseo-monitor watch --kind file-exists --path /scratch/run/receipt --deadline +3600",
+    "git-ref | Git ref SHA | --remote <remote> --ref <ref> --deadline <when> | floor=60 | default=120",
+    "pr-merge | Pull request merge state | --repo <owner/repo> --pr <number> --deadline <when> | floor=60 | default=300",
+    "script | Custom executable | --script <file> --reason \"<why no kind fits>\" --deadline <when> | floor=60 | default=60",
+)
+
+HELP_TEXT = """Usage: paseo-monitor <subcommand> [args]
 
 A cheap, stateless watcher. One launchd-driven sweep observes due watches and
 reports state changes; the caller owns the liveness backstop.
 
 Subcommands:
 
-  watch --kind <kind> [kind args] \
-      [--report-to <agent>] [--interval <s>] --deadline <when> \
-      [--terminal TOK,TOK] [--report-on TOK,TOK] [--report-transitions] \
-      [--with-reason] [--dwell <n-sweeps>] [--label k=v ...] \
-      [--provider <provider>] [--interval <s>] --deadline <when> \
-      [--prohibit <text>] [--failsafe] [--max-fires <n>] \
-      [--max-runs <n>] [--expires-in <duration>] [--no-start-report] \
+  watch --kind <kind> [kind args] \\
+      [--report-to <agent>] [--interval <s>] --deadline <when> \\
+      [--terminal TOK,TOK] [--report-on TOK,TOK] [--report-transitions] \\
+      [--with-reason] [--dwell <n-sweeps>] [--label k=v ...] \\
+      [--provider <provider>] [--interval <s>] --deadline <when> \\
+      [--prohibit <text>] [--failsafe] [--max-fires <n>] \\
+      [--max-runs <n>] [--expires-in <duration>] [--no-start-report] \\
       [--deliver paseo-queue|<command>]
-  watch --script <file> --reason "<why no kind fits>" \
+  watch --script <file> --reason "<why no kind fits>" \\
       --terminal TOK,TOK [same common options as --kind]
       Register a snapshotted custom probe.
   # --script requires --reason; probes are direct argv and never sh -c.
@@ -135,2021 +1912,507 @@ Environment knobs (read once into internal PM_* variables):
 
 The external names above are never read below startup. Probes inherit the
 calling environment deliberately; credentials such as SSH_AUTH_SOCK matter.
-EOF
-    printf '\nKind table:\n'
-    pm_kind_table
-}
 
-# --- Fixed-name shell primitives copied from paseo-queue -----------------
-pm_file_size() {
-    stat -f %z "$1" 2>/dev/null || stat -c %s "$1" 2>/dev/null || wc -c < "$1" 2>/dev/null
-}
+Kind table:
+"""
+HELP_TEXT += "\n".join(KIND_TABLE) + "\n"
 
-pm_dir_mtime() {
-    stat -f %m "$1" 2>/dev/null || stat -c %Y "$1" 2>/dev/null
-}
 
-pm_log_path() {
-    if [ "$1" = "$PM_HOME" ]; then
-        printf '%s\n' "$PM_HOME/sweep.log"
-    else
-        printf '%s\n' "$1/log"
-    fi
-}
+def _cli_config():
+    return replace(CONFIG, shell_report=True)
 
-rotate_log_if_big() {
-    # rotate_log_if_big <dir> -- one-generation rotation for sweep/watch logs.
-    rlb_dir="$1"
-    rlb_log="$(pm_log_path "$rlb_dir")"
-    [ -f "$rlb_log" ] || return 0
-    rlb_size="$(pm_file_size "$rlb_log")"
-    if [ -n "$rlb_size" ] && [ "$rlb_size" -ge "$PM_LOG_MAX_BYTES" ]; then
-        mv -f "$rlb_log" "$rlb_log.1" 2>/dev/null
-    fi
-    return 0
-}
 
-log_line() {
-    # log_line <dir> <event> [detail...] -- append an operational event.
-    ll_dir="$1"
-    ll_event="$2"
-    shift 2
-    mkdir -p "$ll_dir" || return 1
-    ll_log="$(pm_log_path "$ll_dir")"
-    ll_ts="$(TZ=America/New_York date '+%Y-%m-%dT%H:%M:%S%z')"
-    printf '%s [%s] %s %s\n' "$ll_ts" "$$" "$ll_event" "$*" >> "$ll_log" || return 1
-    rotate_log_if_big "$ll_dir"
-}
+def _cli_error(message, code=2):
+    print("paseo-monitor: %s" % message, file=sys.stderr)
+    return code
 
-pm_atomic_write() {
-    # pm_atomic_write <path> <content> -- install content with tmp+mv.
-    paw_path="$1"
-    paw_content="$2"
-    paw_dir="$(dirname "$paw_path")"
-    mkdir -p "$paw_dir" || return 1
-    paw_tmp="$paw_dir/.tmp.$$.${paw_path##*/}"
-    printf '%s\n' "$paw_content" > "$paw_tmp" || return 1
-    mv -f "$paw_tmp" "$paw_path" || return 1
-}
 
-set_state() {
-    # set_state <dir> <state> -- atomically install the state file.
-    ss_dir="$1"
-    ss_state="$2"
-    pm_atomic_write "$ss_dir/state" "$ss_state" || {
-        printf 'paseo-monitor: set_state failed for %s\n' "$ss_dir" >&2
+def _watch_id_valid(value):
+    return bool(value) and value not in (".", "..") and "/" not in value
+
+
+def _cli_args(values):
+    parsed = {
+        "kind": "", "script": "", "reason": "", "report_to": os.environ.get("PASEO_AGENT_ID", ""),
+        "owner": os.environ.get("PASEO_AGENT_ID", ""), "provider": "", "interval": "",
+        "deadline": "", "terminal": DEFAULT_TERMINAL, "report_on": "",
+        "report_transitions": "0", "with_reason": "0", "dwell": "0",
+        "context": "", "labels": "", "prohibit": "", "failsafe": "0",
+        "max_fires": "0", "max_runs": "1", "expires_in": "",
+        "start_report": "1", "deliver": "", "host": "", "job": "",
+        "task": "", "agent": "", "path": "", "remote": "", "ref": "",
+        "repo": "", "pr": "",
+    }
+    takes = {
+        "--kind": "kind", "--script": "script", "--reason": "reason",
+        "--report-to": "report_to", "--provider": "provider",
+        "--interval": "interval", "--deadline": "deadline", "--terminal": "terminal",
+        "--report-on": "report_on", "--dwell": "dwell", "--context": "context",
+        "--max-runs": "max_runs", "--expires-in": "expires_in",
+        "--prohibit": "prohibit", "--max-fires": "max_fires", "--deliver": "deliver",
+        "--host": "host", "--job": "job", "--task": "task", "--agent": "agent",
+        "--path": "path", "--remote": "remote", "--ref": "ref", "--repo": "repo",
+        "--pr": "pr",
+    }
+    missing = {
+        "--kind": "a value", "--script": "a value", "--reason": "a value",
+        "--report-to": "a value", "--provider": "a value", "--interval": "a value",
+        "--deadline": "is required", "--terminal": "a value", "--report-on": "a value",
+        "--dwell": "a value", "--context": "a value", "--max-runs": "a value",
+        "--expires-in": "a duration", "--prohibit": "a value", "--max-fires": "a value",
+        "--deliver": "a command", "--host": "a value", "--job": "a value",
+        "--task": "a value", "--agent": "a value", "--path": "a value",
+        "--remote": "a value", "--ref": "a value", "--repo": "a value", "--pr": "a value",
+    }
+    labels = []
+    index = 0
+    while index < len(values):
+        option = values[index]
+        if option in ("--report-transitions", "--with-reason"):
+            parsed["report_transitions" if option == "--report-transitions" else "with_reason"] = "1"
+            index += 1
+        elif option == "--no-start-report":
+            parsed["start_report"] = "0"
+            index += 1
+        elif option == "--failsafe":
+            parsed["failsafe"] = "1"
+            index += 1
+        elif option == "--label":
+            if index + 1 >= len(values):
+                raise ValueError("--label needs k=v")
+            if "=" not in values[index + 1]:
+                raise ValueError("--label requires k=v")
+            labels.append(values[index + 1])
+            index += 2
+        elif option == "--context-file":
+            if index + 1 >= len(values):
+                raise ValueError("--context-file needs a value")
+            path = Path(values[index + 1])
+            if not path.is_file():
+                raise ValueError("context file not found: %s" % path)
+            index += 2
+        elif option in takes:
+            if index + 1 >= len(values):
+                if option == "--deadline":
+                    raise ValueError("--deadline is required")
+                raise ValueError("%s needs %s" % (option, missing[option]))
+            parsed[takes[option]] = values[index + 1]
+            index += 2
+        else:
+            raise ValueError("unknown watch option: %s" % option)
+    parsed["labels"] = "|".join(labels)
+    if os.environ.get("PASEO_LABELS"):
+        parsed["labels"] = "|".join(filter(None, [os.environ["PASEO_LABELS"], parsed["labels"]]))
+    for env_name, label in (
+        ("PASEO_LABEL_ROLE", "role"), ("PASEO_LABEL_JOB", "job"),
+        ("PASEO_LABEL_ITEM", "item"), ("PASEO_LABEL_LANE", "lane"),
+    ):
+        if os.environ.get(env_name):
+            parsed["labels"] = "|".join(filter(None, [parsed["labels"], "%s=%s" % (label, os.environ[env_name])]))
+    return parsed
+
+
+def _discover_provider(config):
+    try:
+        paseo = resolve_binary("paseo")
+    except FileNotFoundError:
+        return ""
+    inspect_id = os.environ.get("PASEO_AGENT_ID", "")
+    if inspect_id:
+        result = run_probe((paseo, "inspect", inspect_id, "--json"), config=config)
+        if result.returncode == 0:
+            try:
+                value = json.loads(result.stdout.decode("utf-8", "replace"))
+                provider = value.get("Provider", value.get("provider", "")) if isinstance(value, dict) else ""
+                if provider:
+                    return str(provider)
+            except (ValueError, TypeError):
+                pass
+    result = run_probe((paseo, "provider", "ls", "--json"), config=config)
+    if result.returncode == 0:
+        try:
+            value = json.loads(result.stdout.decode("utf-8", "replace"))
+            if isinstance(value, list):
+                for row in value:
+                    if isinstance(row, dict) and str(row.get("status", "")).lower() == "available" and str(row.get("enabled", "")).lower() == "enabled":
+                        return str(row.get("provider", ""))
+        except (ValueError, TypeError):
+            pass
+    return ""
+
+
+def _self_heal_trigger():
+    """Reinstall a missing/stale launchd agent before returning to the caller."""
+    plist = Path.home() / "Library" / "LaunchAgents" / "com.paseo-monitor.sweep.plist"
+    if not plist.is_file() or "paseo-monitor: managed launchd agent" not in plist.read_text(
+            encoding="utf-8", errors="replace"):
+        return
+    launchctl = shutil.which("launchctl")
+    if not launchctl:
+        return
+    loaded = subprocess.run(
+        [launchctl, "print", "gui/%s/com.paseo-monitor.sweep" % os.getuid()],
+        stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL, check=False,
+    )
+    if loaded.returncode == 0:
+        return
+    installer = os.environ.get("PASEO_MONITOR_INSTALLER")
+    if not installer:
+        installer = str(Path(__file__).resolve().parent.parent / "install.sh")
+    if Path(installer).is_file():
+        subprocess.run(["sh", installer, "install"], stdin=subprocess.DEVNULL,
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                       check=False)
+
+
+def _failsafe(config, directory, provider, expires, max_runs, prompt):
+    if not provider:
+        return ""
+    spec = read_spec(directory / "spec")
+    try:
+        paseo = spec.get("paseo_bin") or resolve_binary("paseo")
+    except FileNotFoundError:
+        return ""
+    result = run_probe(
+        (paseo, "schedule", "create", prompt, "--every", expires,
+         "--max-runs", max_runs, "--expires-in", expires,
+         "--provider", provider, "--json"), config=config,
+    )
+    if result.returncode:
+        return ""
+    try:
+        data = json.loads(result.stdout.decode("utf-8", "replace"))
+        schedule_id = data.get("id", data.get("scheduleId", data.get("schedule_id", ""))) if isinstance(data, dict) else ""
+    except (ValueError, TypeError):
+        schedule_id = ""
+    if schedule_id:
+        atomic_write(directory / "failsafe", schedule_id)
+        log_line(directory, "FAILSAFE-CREATED", "schedule=%s every=%s max-runs=%s expires-in=%s" %
+                 (schedule_id, expires, max_runs, expires), config=config)
+        return str(schedule_id)
+    return ""
+
+
+def _cli_watch(args, config):
+    try:
+        values = _cli_args(args)
+        if values["script"] and values["kind"]:
+            return _cli_error("choose --kind or --script, not both")
+        if not values["script"] and not values["kind"]:
+            return _cli_error("watch needs --kind or --script")
+        if values["script"]:
+            values["kind"] = "script"
+        if values["kind"] == "agent" and values["dwell"] == "0":
+            values["dwell"] = "2"
+        if values["kind"] not in set(KIND_FLOORS) | {"file-exists"}:
+            return _cli_error("unknown kind: %s" % values["kind"])
+        if values["kind"] == "agent" and not values["report_on"]:
+            values["report_on"] = "BLOCKED-PERMISSION,CLOSED,ARCHIVED"
+            values["report_transitions"] = "1"
+        if values["kind"] == "agent" and not values["dwell"]:
+            values["dwell"] = "2"
+        if values["script"] and not values["reason"]:
+            return _cli_error("--reason is mandatory with --script")
+        if values["script"] and "--terminal" not in args:
+            return _cli_error("--terminal is mandatory with --script")
+        if values["expires_in"] and values["failsafe"] != "1":
+            return _cli_error("--expires-in requires --failsafe")
+        if values["report_on"] and ":" in values["report_on"]:
+            values["with_reason"] = "1"
+        watch_id, observation = register_watch(values, config=config)
+    except ValueError as exc:
+        return _cli_error(str(exc))
+    except RuntimeError as exc:
+        message = str(exc)
+        if message.startswith("registration probe failed") and ": " in message:
+            detail, message = message.split(": ", 1)
+            if detail:
+                print(message, file=sys.stderr)
+            print("paseo-monitor: %s" % detail, file=sys.stderr)
+        else:
+            print("paseo-monitor: %s" % message, file=sys.stderr)
         return 1
-    }
-}
-
-ensure_dirs() {
-    # ensure_dirs <dir> -- create the durable monitor directories.
-    ed_dir="$1"
-    mkdir -p "$ed_dir/watches" || return 1
+    _self_heal_trigger()
+    print("watch %s registered: token=%s" % (watch_id, observation.token))
+    if values.get("failsafe") == "1":
+        provider = values.get("provider") or _discover_provider(config)
+        if provider:
+            update_spec(config.home / "watches" / watch_id / "spec", "provider", provider)
+        expires = values.get("expires_in") or "%ss" % max(
+            0, _uint(values.get("deadline"), pm_now()) - _uint(values.get("registered"), pm_now())
+        )
+        prompt = "paseo-monitor status %s before anything else; then inspect paseo-monitor log %s. PROHIBITIONS: %s" % (
+            watch_id, watch_id, _report_value(values.get("prohibit")) or "(none)"
+        )
+        directory = config.home / "watches" / watch_id
+        schedule = _failsafe(config, directory, provider, expires, values.get("max_runs", "1"), prompt)
+        if schedule:
+            print("failsafe schedule=%s" % schedule)
+        else:
+            print("paseo-monitor: WARN failsafe schedule not created (SCHEDULE_CREATE_FAILED); caller owns the liveness backstop", file=sys.stderr)
+            print("paseo schedule create %s --every %s --max-runs 1 --expires-in %s --provider %s --json" %
+                  (_shell_quote(prompt), expires, expires, provider or "<provider>"))
+    print("delivery is best-effort; caller owns the liveness backstop")
     return 0
-}
 
-pm_is_full_uuid() {
-    case "$1" in
-        ????????-????-????-????-????????????) return 0 ;;
-        *) return 1 ;;
-    esac
-}
 
-PM_PY_MATCH_AGENT="$(cat <<'PY'
-import json, sys
-query = sys.argv[1]
-try:
-    data = json.load(sys.stdin)
-except Exception:
-    data = []
-if isinstance(data, dict):
-    data = data.get("agents", [])
-if not isinstance(data, list):
-    data = []
-matched = {}
-for agent in data:
-    aid = agent.get("id", "")
-    name = agent.get("name", "")
-    if query and aid.startswith(query):
-        matched[aid] = agent
-    elif name == query:
-        matched[aid] = agent
-if len(matched) == 1:
-    agent = next(iter(matched.values()))
-    print("MATCH\t%s\t%s" % (agent.get("id", ""), agent.get("name", "")))
-elif len(matched) == 0:
-    print("NONE")
-else:
-    print("AMBIGUOUS\t" + "\t".join("%s (%s)" % (a.get("id", ""), a.get("name", "")) for a in matched.values()))
-PY
-)"
+def _cli_header(config):
+    beacon = config.home / "sweep.beacon"
+    if not beacon.is_file():
+        print("last-sweep-age: unknown")
+        return
+    fields = beacon.read_text(encoding="utf-8", errors="replace").strip().split(" ", 1)
+    epoch = _uint(fields[0] if fields else "", pm_now())
+    age = max(0, pm_now() - epoch)
+    print("last-sweep-age: %ss (last-sweep=%s)" % (age, fields[1] if len(fields) > 1 else ""))
 
-PM_PY_INSPECT_AGENT="$(cat <<'PY'
-import json, sys
-try:
-    agent = json.load(sys.stdin)
-except Exception:
-    print("unknown 0 0")
-    sys.exit(1)
-if isinstance(agent, list):
-    agent = agent[0] if agent else {}
-status = agent.get("Status", agent.get("status", "unknown"))
-archived = agent.get("Archived", agent.get("archived", False))
-permissions = agent.get("PendingPermissions", agent.get("pendingPermissions", []))
-if not isinstance(permissions, list):
-    permissions = []
-print("%s %s %d" % (str(status).lower(), 1 if archived else 0, len(permissions)))
-PY
-)"
 
-pm_match_agent() {
-    "$PM_PYTHON" -c "$PM_PY_MATCH_AGENT" "$1"
-}
-
-resolve_agent() {
-    # resolve_agent <query> <allow_orphan:0|1> -- print UUID<TAB>name.
-    ra_query="$1"
-    ra_allow_orphan="${2:-0}"
-    ra_json="$(paseo ls --json 2>/dev/null)" || {
-        printf 'paseo-monitor: paseo ls --json failed (daemon unreachable?)\n' >&2
-        return 3
-    }
-    ra_result="$(printf '%s' "$ra_json" | pm_match_agent "$ra_query")"
-    ra_tag="$(printf '%s\n' "$ra_result" | cut -f1)"
-    case "$ra_tag" in
-        MATCH)
-            printf '%s\t%s\n' "$(printf '%s\n' "$ra_result" | cut -f2)" "$(printf '%s\n' "$ra_result" | cut -f3-)"
-            return 0
-            ;;
-        AMBIGUOUS)
-            {
-                printf 'paseo-monitor: ambiguous agent "%s", candidates:\n' "$ra_query"
-                printf '%s\n' "$ra_result" | cut -f2- | tr '\t' '\n' | sed 's/^/  /'
-            } >&2
-            return 2
-            ;;
-        *)
-            if [ "$ra_allow_orphan" = "1" ] && pm_is_full_uuid "$ra_query" && [ -d "$PM_HOME/watches/$ra_query" ]; then
-                printf '%s\t\n' "$ra_query"
-                return 0
-            fi
-            printf 'paseo-monitor: no agent matches "%s"\n' "$ra_query" >&2
-            return 2
-            ;;
-    esac
-}
-
-inspect_agent() {
-    # inspect_agent <uuid> -- print status archived pending-permission-count.
-    ia_json="$(paseo inspect "$1" --json 2>/dev/null)" || return 1
-    [ -n "$ia_json" ] || return 1
-    printf '%s' "$ia_json" | "$PM_PYTHON" -c "$PM_PY_INSPECT_AGENT"
-}
-
-lock_holder_alive() {
-    # lock_holder_alive <dir> -- liveness by pid plus process identity.
-    lha_lockdir="$1/sweep.lock"
-    [ -d "$lha_lockdir" ] || return 1
-    if [ -f "$lha_lockdir/pid" ]; then
-        lha_pid="$(cat "$lha_lockdir/pid" 2>/dev/null)"
-        case "$lha_pid" in ''|*[!0-9]*) return 1 ;; esac
-        if kill -0 "$lha_pid" 2>/dev/null &&
-            ps -p "$lha_pid" -o command= 2>/dev/null | grep -q 'paseo-monitor'; then
-            return 0
-        fi
-        return 1
-    fi
-    lha_now="$(date +%s)"
-    lha_mtime="$(pm_dir_mtime "$lha_lockdir")"
-    if [ -n "$lha_mtime" ] && [ $((lha_now - lha_mtime)) -lt "$PM_LOCK_GRACE_SECONDS" ]; then
-        return 0
-    fi
-    return 1
-}
-
-break_stale_lock() {
-    bsl_dir="$1"
-    bsl_stale="$bsl_dir/sweep.lock.stale.$$"
-    if mv "$bsl_dir/sweep.lock" "$bsl_stale" 2>/dev/null; then
-        rm -rf "$bsl_stale" 2>/dev/null
-    fi
+def _cli_ls(config):
+    ensure_dirs(config.home)
+    for directory in config.home.joinpath("watches").iterdir():
+        if directory.is_symlink() or not (directory / "spec").is_file() or _is_graveyard(directory):
+            continue
+        spec = read_spec(directory / "spec")
+        state = directory.joinpath("state").read_text().strip() if (directory / "state").is_file() else "active"
+        next_due_value = directory.joinpath("nextDue").read_text().strip() if (directory / "nextDue").is_file() else ""
+        ours = "yes" if os.environ.get("PASEO_AGENT_ID") and spec.get("owner") == os.environ.get("PASEO_AGENT_ID") else "no"
+        print("%s kind=%s target=%s state=%s owner=%s report_to=%s ours=%s nextDue=%s reason=%s" %
+              (directory.name, spec.get("kind", ""), watch_target(spec), state,
+               _owner_display(spec), spec.get("report_to", ""), ours, next_due_value,
+               spec.get("reason", "")))
     return 0
-}
 
-acquire_lock() {
-    # acquire_lock <dir> -- mkdir-based exclusive global sweep lock.
-    al_dir="$1"
-    mkdir -p "$al_dir" || return 1
-    if mkdir "$al_dir/sweep.lock" 2>/dev/null; then
-        printf '%s\n' "$$" > "$al_dir/sweep.lock/pid"
-        return 0
-    fi
-    lock_holder_alive "$al_dir" && return 1
-    break_stale_lock "$al_dir"
-    if mkdir "$al_dir/sweep.lock" 2>/dev/null; then
-        printf '%s\n' "$$" > "$al_dir/sweep.lock/pid"
-        return 0
-    fi
-    return 1
-}
 
-release_lock() {
-    rl_dir="$1"
-    [ -d "$rl_dir/sweep.lock" ] || return 0
-    [ -f "$rl_dir/sweep.lock/pid" ] || return 1
-    [ "$(cat "$rl_dir/sweep.lock/pid" 2>/dev/null)" = "$$" ] || return 1
-    rm -rf "$rl_dir/sweep.lock" 2>/dev/null
-}
-
-pm_init_state() {
-    mkdir -p "$PM_HOME/watches" "$PM_HOME/graveyard" || {
-        printf 'paseo-monitor: cannot create state root: %s\n' "$PM_HOME" >&2
-        return 1
-    }
-}
-
-pm_is_graveyard() {
-    [ -f "$1/graveyard" ]
-}
-
-pm_watch_owner() {
-    pwo_dir="$1"
-    pwo_owner="$(pm_spec_value owner "$pwo_dir/spec" 2>/dev/null || printf '')"
-    [ -n "$pwo_owner" ] && printf '%s\n' "$pwo_owner" || printf '(unrecorded)\n'
-}
-
-pm_watch_source() {
-    # pm_watch_source <id> -- print live or graveyard directory.
-    pws_id="$1"
-    pws_live="$PM_HOME/watches/$pws_id"
-    if [ -f "$pws_live/graveyard" ]; then
-        printf '%s\n' "$PM_HOME/graveyard/$pws_id"
-    elif [ -f "$pws_live/spec" ]; then
-        printf '%s\n' "$pws_live"
-    elif [ -f "$PM_HOME/graveyard/$pws_id/spec" ]; then
-        printf '%s\n' "$PM_HOME/graveyard/$pws_id"
-    else
-        return 1
-    fi
-}
-
-pm_watch_owner_key() {
-    pwok_dir="$1"
-    printf '%s\n' "$(pm_spec_value owner "$pwok_dir/spec" 2>/dev/null || printf '')"
-}
-
-PM_PROBE_TIMEOUT=45
-PM_SWEEP_PARALLELISM=4
-PM_DEFAULT_TERMINAL="COMPLETED,SUCCEEDED,FAILED,CANCELLED,TIMEOUT,ERROR,CLOSED,ARCHIVED,DONE"
-pm_now() {
-    date +%s
-}
-
-pm_sweep_beacon() {
-    psb_now="$(pm_now)"
-    psb_stamp="$(TZ=America/New_York date '+%Y-%m-%dT%H:%M:%S%z')"
-    pm_atomic_write "$PM_HOME/sweep.beacon" "$psb_now $psb_stamp"
-}
- 
-pm_trigger_plist() {
-    printf '%s\n' "$HOME/Library/LaunchAgents/$PM_LAUNCHD_LABEL.plist"
-}
-
-pm_trigger_is_fresh() {
-    pti_plist="$(pm_trigger_plist)"
-    [ -f "$pti_plist" ] || return 1
-    grep -q 'paseo-monitor: managed launchd agent' "$pti_plist" || return 1
-    command -v launchctl >/dev/null 2>&1 || return 1
-    launchctl print "gui/$(id -u)/$PM_LAUNCHD_LABEL" >/dev/null 2>&1
-}
-
-pm_trigger_state() {
-    pt_state_plist="$(pm_trigger_plist)"
-    [ -f "$pt_state_plist" ] || {
-        printf 'not-installed\n'
-        return 0
-    }
-    pm_trigger_is_fresh && printf 'fresh\n' || printf 'stale\n'
-}
-
-pm_self_heal_trigger() {
-    pti_plist="$(pm_trigger_plist)"
-    [ -f "$pti_plist" ] || return 0
-    pm_trigger_is_fresh && return 0
-    pti_installer="$PM_INSTALLER"
-    if [ ! -f "$pti_installer" ]; then
-        pti_repo="$(sed -n '/<key>WorkingDirectory<\/key>/{n;s/^[[:space:]]*<string>\(.*\)<\/string>$/\1/p;}' "$pti_plist")"
-        pti_installer="$pti_repo/install.sh"
-    fi
-    [ -f "$pti_installer" ] || return 1
-    sh "$pti_installer" install >/dev/null 2>&1
-}
-pm_spec_value() {
-    psv_key="$1"
-    psv_file="$2"
-    sed -n "s/^${psv_key}=//p" "$psv_file" | sed -n '1p'
-}
- 
-pm_valid_uint() {
-    case "$1" in ''|*[!0-9]*) return 1 ;; esac
+def _cli_status(args, config):
+    if len(args) > 1:
+        return 2
+    ensure_dirs(config.home)
+    _cli_header(config)
+    directories = []
+    if args:
+        if not _watch_id_valid(args[0]):
+            return _cli_error("invalid watch id: %s" % args[0])
+        source = _watch_source(args[0], config)
+        if source is None:
+            return _cli_error("watch not found: %s" % args[0], 1)
+        directories = [source]
+    else:
+        directories = [
+            path for path in config.home.joinpath("watches").iterdir()
+            if not path.is_symlink() and (path / "spec").is_file() and not _is_graveyard(path)
+        ]
+    for directory in directories:
+        text = status(directory, config)
+        print(text, end="")
+        state = "removed" if _is_graveyard(directory) else (
+            directory.joinpath("state").read_text().strip()
+            if (directory / "state").is_file() else "active"
+        )
+        if state == "parked":
+            print("paseo-monitor: WARN watch=%s state=parked; will not probe until poked" % directory.name, file=sys.stderr)
+        elif state == "delivery-failed":
+            print("paseo-monitor: WARN watch=%s state=delivery-failed" % directory.name, file=sys.stderr)
+        if (directory / "undelivered").is_file():
+            print("paseo-monitor: WARN watch=%s undelivered=yes" % directory.name, file=sys.stderr)
+        health = (directory / "health").read_text().strip() if (directory / "health").is_file() else "0 none"
+        if _uint(health.split()[0] if health else "", 0):
+            print("paseo-monitor: WARN watch=%s health=%s" % (directory.name, health), file=sys.stderr)
     return 0
-}
- 
-pm_hash_jitter() {
-    phj_id="$1"
-    phj_interval="$2"
-    [ "$PM_FAST_SWEEP" = 1 ] && {
-        printf '0\n'
-        return 0
-    }
-    phj_hash="$(printf '%s\n' "$phj_id" | cksum | cut -d ' ' -f1)"
-    printf '%s\n' "$((phj_hash % phj_interval))"
-}
- 
-pm_next_due() {
-    pnd_now="$1"
-    pnd_interval="$2"
-    pnd_id="$3"
-    pnd_jitter="$(pm_hash_jitter "$pnd_id" "$pnd_interval")"
-    if [ "$PM_FAST_SWEEP" = 1 ]; then
-        printf '%s\n' "$pnd_now"
-    else
-        printf '%s\n' "$((pnd_now + pnd_interval + pnd_jitter))"
-    fi
-}
- 
-pm_run_with_timeout() {
-    # pm_run_with_timeout <seconds> <stdout> <stderr> <argv...>
-    [ "$#" -ge 4 ] || return 2
-    pmt_seconds="$1"
-    pmt_out="$2"
-    pmt_err="$3"
-    shift 3
-    pm_valid_uint "$pmt_seconds" || return 2
-    pmt_base="${pmt_out}.$$"
-    pmt_out_pipe="${pmt_base}.out.pipe"
-    pmt_err_pipe="${pmt_base}.err.pipe"
-    pmt_timeout_marker="${pmt_base}.timed-out"
-    rm -f "$pmt_out_pipe" "$pmt_err_pipe" "$pmt_timeout_marker"
-    mkfifo "$pmt_out_pipe" "$pmt_err_pipe" || return 2
-    (
-        dd bs=1 count=4096 2>/dev/null
-        cat >/dev/null
-    ) <"$pmt_out_pipe" >"$pmt_out" &
-    pmt_out_cap=$!
-    (
-        dd bs=1 count=8192 2>/dev/null
-        cat >/dev/null
-    ) <"$pmt_err_pipe" >"$pmt_err" &
-    pmt_err_cap=$!
-    "$@" </dev/null >"$pmt_out_pipe" 2>"$pmt_err_pipe" &
-    pmt_child=$!
-    (
-        sleep "$pmt_seconds" &
-        pmt_sleep_pid=$!
-        trap 'kill "$pmt_sleep_pid" 2>/dev/null; exit 0' 0 1 2 3 15
-        wait "$pmt_sleep_pid"
-        trap - 0 1 2 3 15
-        if kill -0 "$pmt_child" 2>/dev/null; then
-            : > "$pmt_timeout_marker"
-            kill "$pmt_child" 2>/dev/null
-        fi
-    ) &
-    pmt_killer=$!
-    wait "$pmt_child" 2>/dev/null
-    pmt_rc=$?
-    if [ -f "$pmt_timeout_marker" ]; then
-        kill "$pmt_out_cap" "$pmt_err_cap" 2>/dev/null
-        wait "$pmt_out_cap" 2>/dev/null
-        wait "$pmt_err_cap" 2>/dev/null
-        kill "$pmt_killer" 2>/dev/null
-        wait "$pmt_killer" 2>/dev/null
-        rm -f "$pmt_out_pipe" "$pmt_err_pipe" "$pmt_timeout_marker"
-        return 124
-    fi
-    kill "$pmt_killer" 2>/dev/null
-    wait "$pmt_killer" 2>/dev/null
-    wait "$pmt_out_cap" 2>/dev/null
-    wait "$pmt_err_cap" 2>/dev/null
-    rm -f "$pmt_out_pipe" "$pmt_err_pipe"
-    return "$pmt_rc"
-}
- 
-pm_remote_shell_quote() {
-    # pm_remote_shell_quote <value> -- quote one value for an SSH remote shell.
-    printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"
-}
 
-pm_run_remote_probe() {
-    # pm_run_remote_probe <stdout> <stderr> <host> <remote argv...>.
-    # Normalize ssh-level rc=255 while preserving the existing health path.
-    prr_out="$1"
-    prr_err="$2"
-    prr_host="$3"
-    shift 3
-    pm_run_with_timeout "$PM_PROBE_TIMEOUT" "$prr_out" "$prr_err" \
-        ssh -o BatchMode=yes -o ConnectTimeout=15 "$prr_host" "$@"
-    prr_rc=$?
-    if [ "$prr_rc" -eq 255 ]; then
-        prr_err_text="$(cat "$prr_err" 2>/dev/null || printf '')"
-        prr_class="$(pm_health_failure_class "$prr_rc" "$prr_err_text")"
-        {
-            printf '%s-class ssh-rc=255\n' "$prr_class"
-            [ -n "$prr_err_text" ] && printf '%s\n' "$prr_err_text"
-        } > "$prr_err.classified.$$"
-        mv -f "$prr_err.classified.$$" "$prr_err"
-    fi
-    return "$prr_rc"
-}
 
-pm_slurm_probe_output() {
-    # pm_slurm_probe_output <watch-dir> <stdout> -- map sacct/squeue artifacts.
-    pspo_dir="$1"
-    pspo_out="$2"
-    pspo_sacct="$(sed '/^PASEO_MONITOR_SQUEUE$/,$d' "$pspo_out" | sed '/^[[:space:]]*$/d' | sed -n '1p')"
-    pspo_squeue=""
-    pspo_has_squeue=0
-    grep -q '^PASEO_MONITOR_SQUEUE$' "$pspo_out" && pspo_has_squeue=1
-    if grep -q '^PASEO_MONITOR_SQUEUE$' "$pspo_out"; then
-        pspo_squeue="$(sed -n '/^PASEO_MONITOR_SQUEUE$/,$p' "$pspo_out" | sed '1d' | sed '/^[[:space:]]*$/d' | sed -n '1p')"
-    fi
-    pspo_state="$pspo_sacct"
-    if [ -z "$pspo_state" ] && [ -n "$pspo_squeue" ]; then
-        pspo_state="${pspo_squeue%%|*}"
-    fi
-    case "$pspo_state" in
-        *'|'*) pspo_state="${pspo_state#*|}"; pspo_state="${pspo_state%%|*}" ;;
-    esac
-    pspo_state="${pspo_state%% *}"
-    if [ -n "$pspo_state" ]; then
-        pspo_token="$pspo_state"
-        pspo_detail="sacct=$pspo_sacct"
-        if [ -n "$pspo_squeue" ]; then
-            pspo_sq_state="${pspo_squeue%%|*}"
-            pspo_sq_reason="${pspo_squeue#*|}"
-            if [ "$pspo_sq_state" = "$pspo_squeue" ]; then pspo_sq_reason="" ; fi
-            if [ "$pspo_sq_state" = PENDING ] && [ -n "$pspo_sq_reason" ]; then
-                pspo_token="PENDING:$pspo_sq_reason"
-            fi
-            pspo_detail="$pspo_detail squeue=$pspo_squeue"
-        fi
-    elif [ "$pspo_has_squeue" -eq 1 ] &&
-        [ -n "$(cat "$pspo_dir/last" 2>/dev/null || printf '')" ] &&
-        [ "$(cat "$pspo_dir/last" 2>/dev/null || printf '')" != PENDING ]; then
-        pspo_token=VANISHED
-        pspo_detail="sacct and squeue empty after last=$(cat "$pspo_dir/last")"
-    else
-        pspo_token=PENDING
-        pspo_detail="sacct empty (accounting lag); squeue=$pspo_squeue"
-    fi
-    printf '%s %s\n' "$pspo_token" "$pspo_detail" > "$pspo_out"
-}
-
-pm_pbs_probe_output() {
-    # pm_pbs_probe_output <watch-dir> <stdout> -- map qstat live/history artifacts.
-    pppo_dir="$1"
-    pppo_out="$2"
-    pppo_live="$pppo_out"
-    pppo_history=""
-    if grep -q '^PASEO_MONITOR_PBS_HISTORICAL$' "$pppo_out"; then
-        pppo_live="$pppo_out.live.$$"
-        pppo_history="$pppo_out.history.$$"
-        sed '/^PASEO_MONITOR_PBS_HISTORICAL$/,$d' "$pppo_out" > "$pppo_live"
-        sed -n '/^PASEO_MONITOR_PBS_HISTORICAL$/,$p' "$pppo_out" | sed '1d' > "$pppo_history"
-    fi
-    pppo_state="$(sed -n 's/^[[:space:]]*job_state[[:space:]]*=[[:space:]]*//p' "$pppo_live" | sed -n '1p')"
-    pppo_source=qstat
-    pppo_record="$pppo_live"
-    if [ -z "$pppo_state" ] && [ -n "$pppo_history" ]; then
-        pppo_state="$(sed -n 's/^[[:space:]]*job_state[[:space:]]*=[[:space:]]*//p' "$pppo_history" | sed -n '1p')"
-        pppo_source=qstat-x
-        pppo_record="$pppo_history"
-    fi
-    pppo_state="${pppo_state%% *}"
-    pppo_state="$(printf '%s\n' "$pppo_state" | tr 'a-z' 'A-Z')"
-    if [ -n "$pppo_state" ]; then
-        pppo_raw="$(tr '\n' ' ' < "$pppo_record" | cut -c1-384)"
-        printf '%s %s=%s\n' "$pppo_state" "$pppo_source" "$pppo_raw" > "$pppo_out"
-    else
-        printf 'UNKNOWN qstat live and historical lookup empty\n' > "$pppo_out"
-    fi
-    [ "$pppo_live" = "$pppo_out" ] || rm -f "$pppo_live" "$pppo_history"
-}
-pm_git_ref_probe_output() {
-    # pm_git_ref_probe_output <watch-dir> <stdout> -- extract the observed SHA.
-    pgr_dir="$1"
-    pgr_out="$2"
-    pgr_line="$(sed -n '1p' "$pgr_out")"
-    pgr_sha="$(printf '%s\n' "$pgr_line" | cut -f1)"
-    pgr_ref="$(printf '%s\n' "$pgr_line" | cut -f2)"
-    case "$pgr_sha" in
-        ''|*[!0-9A-Fa-f]*) return 1 ;;
-    esac
-    pgr_old="$(cat "$pgr_dir/last" 2>/dev/null || printf '')"
-    [ -n "$pgr_old" ] || pgr_old="$pgr_sha"
-    printf '%s old=%s new=%s ref=%s observed=%s\n' \
-        "$pgr_sha" "$pgr_old" "$pgr_sha" "$pgr_ref" "$pgr_line" > "$pgr_out"
-}
- 
-pm_parse_probe_output() {
-    ppo_line="$(sed -n '1p' "$1")"
-    [ -n "$ppo_line" ] || return 1
-    ppo_token="${ppo_line%% *}"
-    [ -n "$ppo_token" ] || return 1
-    ppo_detail="${ppo_line#"$ppo_token"}"
-    ppo_detail="${ppo_detail# }"
-    PM_PARSED_TOKEN="$ppo_token"
-    PM_PARSED_DETAIL="$ppo_detail"
+def _cli_log(args, config):
+    if not args:
+        return _cli_error("log needs a watch id")
+    watch_id = args[0]
+    if not _watch_id_valid(watch_id):
+        return _cli_error("invalid watch id: %s" % watch_id)
+    count, follow = 20, False
+    index = 1
+    while index < len(args):
+        if args[index] == "-f":
+            follow = True
+            index += 1
+        elif args[index] == "-n":
+            if index + 1 >= len(args):
+                return _cli_error("-n needs a value")
+            if not pm_valid_uint(args[index + 1]):
+                return _cli_error("-n must be an integer")
+            count, index = int(args[index + 1]), index + 2
+        else:
+            return _cli_error("unknown log option: %s" % args[index])
+    directory = _watch_source(watch_id, config)
+    if directory is None:
+        return _cli_error("log not found for watch: %s" % watch_id, 1)
+    log = directory / "log"
+    rotated = directory / "log.1"
+    if not log.is_file() and not rotated.is_file():
+        return _cli_error("log not found for watch: %s" % watch_id, 1)
+    contents = ""
+    if rotated.is_file():
+        contents += rotated.read_text(encoding="utf-8", errors="replace")
+    if log.is_file():
+        contents += log.read_text(encoding="utf-8", errors="replace")
+    lines = contents.splitlines()
+    print("\n".join(lines[-count:]))
+    if lines:
+        print()
+    if follow:
+        while True:
+            time.sleep(1)
     return 0
-}
-pm_resolve_binary() {
-    # pm_resolve_binary <name> -- resolve one executable to an absolute path.
-    prb_name="$1"
-    if [ "$prb_name" = python3 ]; then
-        [ -n "$PM_PYTHON" ] || {
-            [ -x "$PM_PYTHON_RESOLVER" ] || return 1
-            PM_PYTHON="$("$PM_PYTHON_RESOLVER" 2>/dev/null || printf '')"
-        }
-        [ -n "$PM_PYTHON" ] || return 1
-        PM_RESOLVED_BINARY="$PM_PYTHON"
-        return 0
-    fi
-    case "$prb_name" in
-        /*)
-            [ -x "$prb_name" ] || {
-                printf 'paseo-monitor: required helper not found: %s\n' "$prb_name" >&2
-                return 1
-            }
-            PM_RESOLVED_BINARY="$prb_name"
-            return 0
-            ;;
-        */*)
-            [ -x "$prb_name" ] || {
-                printf 'paseo-monitor: required helper not found: %s\n' "$prb_name" >&2
-                return 1
-            }
-            prb_dir="${prb_name%/*}"
-            prb_base="${prb_name##*/}"
-            prb_abs_dir="$(CDPATH= cd -P -- "$prb_dir" 2>/dev/null && pwd)" || return 1
-            PM_RESOLVED_BINARY="$prb_abs_dir/$prb_base"
-            return 0
-            ;;
-    esac
-    prb_old_ifs="$IFS"
-    IFS=:
-    for prb_dir in ${PATH:-}; do
-        [ -n "$prb_dir" ] || prb_dir=.
-        [ -x "$prb_dir/$prb_name" ] || continue
-        case "$prb_dir" in
-            /*) PM_RESOLVED_BINARY="$prb_dir/$prb_name" ;;
-            *) prb_abs_dir="$(CDPATH= cd -P -- "$prb_dir" 2>/dev/null && pwd)" || continue
-                PM_RESOLVED_BINARY="$prb_abs_dir/$prb_name" ;;
-        esac
-        IFS="$prb_old_ifs"
-        return 0
-    done
-    IFS="$prb_old_ifs"
-    printf 'paseo-monitor: required helper not found: %s\n' "$prb_name" >&2
-    return 1
-}
-
-pm_kind_helper() {
-    # pm_kind_helper <kind> -- resolve helpers required by a bundled kind.
-    pkh_kind="$1"
-    case "$pkh_kind" in
-        agent) pm_resolve_binary paseo ;;
-        globus) pm_resolve_binary globus ;;
-        pr-merge) pm_resolve_binary gh ;;
-        *) PM_RESOLVED_BINARY="" ;;
-    esac
-}
-
-pm_spec_backfill() {
-    # pm_spec_backfill <dir> <key> <value> -- add or replace one spec key in place.
-    psb_dir="$1"
-    psb_key="$2"
-    psb_val="$3"
-    [ -f "$psb_dir/spec" ] || return 1
-    psb_new="$(awk -v k="$psb_key" -v v="$psb_val" '
-        index($0, k "=") == 1 { print k "=" v; found = 1; next }
-        { print }
-        END { if (!found) print k "=" v }
-    ' "$psb_dir/spec")" || return 1
-    pm_atomic_write "$psb_dir/spec" "$psb_new"
-}
 
 
-pm_agent_dwell_accept() {
-    # pm_agent_dwell_accept <watch-dir> <token> -- return 1 while candidate is dwelling.
-    pada_dir="$1"
-    pada_token="$2"
-    pada_dwell="$(pm_spec_value dwell "$pada_dir/spec")"
-    case "$pada_token" in IDLE|RUNNING) ;; *) rm -f "$pada_dir/dwell"; return 0 ;; esac
-    pm_valid_uint "$pada_dwell" || pada_dwell=0
-    [ "$pada_dwell" -gt 1 ] || {
-        rm -f "$pada_dir/dwell"
-        return 0
-    }
-    pada_old="$(cat "$pada_dir/last" 2>/dev/null || printf '')"
-    [ "$pada_token" != "$pada_old" ] || {
-        rm -f "$pada_dir/dwell"
-        return 0
-    }
-    pada_saved="$(cat "$pada_dir/dwell" 2>/dev/null || printf '')"
-    pada_saved_token="${pada_saved%% *}"
-    pada_saved_count="${pada_saved#* }"
-    pm_valid_uint "$pada_saved_count" || pada_saved_count=0
-    if [ "$pada_saved_token" = "$pada_token" ]; then
-        pada_count=$((pada_saved_count + 1))
-    else
-        pada_count=1
-    fi
-    if [ "$pada_count" -lt "$pada_dwell" ]; then
-        pm_atomic_write "$pada_dir/dwell" "$pada_token $pada_count" || :
-        log_line "$pada_dir" DWELL "$pada_token count=$pada_count/$pada_dwell" || :
-        return 1
-    fi
-    rm -f "$pada_dir/dwell"
+def _cli_poke(args, config):
+    if len(args) != 1:
+        return _cli_error("poke needs a watch id")
+    watch_id = args[0]
+    if not _watch_id_valid(watch_id):
+        return _cli_error("invalid watch id: %s" % watch_id)
+    directory = config.home / "watches" / watch_id
+    if not (directory / "spec").is_file() or _is_graveyard(directory):
+        return _cli_error("watch not found: %s" % watch_id, 1)
+    if (directory / "state").is_file() and directory.joinpath("state").read_text().strip() == "parked":
+        set_state(directory, "active")
+        log_line(directory, "POKE", "resumed parked watch", config=config)
+    atomic_write(directory / "nextDue", "0")
+    _sweep_watch(directory, config)
     return 0
-}
- 
-pm_run_registered_probe() {
-    prp_dir="$1"
-    prp_out="$2"
-    prp_err="$3"
-    prp_kind="$(pm_spec_value kind "$prp_dir/spec")"
-    prp_host="$(pm_spec_value host "$prp_dir/spec")"
-    prp_job="$(pm_spec_value job "$prp_dir/spec")"
-    prp_task="$(pm_spec_value task "$prp_dir/spec")"
-    prp_agent="$(pm_spec_value agent "$prp_dir/spec")"
-    prp_path="$(pm_spec_value path "$prp_dir/spec")"
-    prp_remote="$(pm_spec_value remote "$prp_dir/spec")"
-    prp_ref="$(pm_spec_value ref "$prp_dir/spec")"
-    prp_repo="$(pm_spec_value repo "$prp_dir/spec")"
-    prp_pr="$(pm_spec_value pr "$prp_dir/spec")"
-    prp_with_reason="$(pm_spec_value with_reason "$prp_dir/spec")"
-    prp_helper="$(pm_spec_value helper "$prp_dir/spec")"
-    prp_python="$(pm_spec_value python "$prp_dir/spec")"
-    # Watches registered before helper snapshotting carry no helper=/python= in
-    # their spec. Resolve once from the current environment and back-fill, so a
-    # pre-existing watch recovers instead of exec'ing an empty string (rc 127)
-    # on every sweep forever. Newly registered watches never reach this path.
-    if [ -z "$prp_helper" ]; then
-        pm_kind_helper "$prp_kind" || return 127
-        prp_helper="$PM_RESOLVED_BINARY"
-        [ -z "$prp_helper" ] || pm_spec_backfill "$prp_dir" helper "$prp_helper" || :
-    fi
-    if [ -z "$prp_python" ] && pm_resolve_binary python3 2>/dev/null; then
-        prp_python="$PM_RESOLVED_BINARY"
-        pm_spec_backfill "$prp_dir" python "$prp_python" || :
-    fi
-    case "$prp_kind" in
-        script)
-            pm_run_with_timeout "$PM_PROBE_TIMEOUT" "$prp_out" "$prp_err" "$prp_dir/probe"
-            ;;
-        slurm)
-            if [ "$prp_with_reason" = 1 ]; then
-                prp_job_q="$(pm_remote_shell_quote "$prp_job")"
-                prp_slurm_cmd="sacct -X -j $prp_job_q --parsable2 --noheader --format=State; prp_sacct_rc=\$?; printf '\\nPASEO_MONITOR_SQUEUE\\n'; squeue -h -j $prp_job_q -o '%T|%R'; prp_squeue_rc=\$?; [ \$prp_sacct_rc -eq 0 ] && [ \$prp_squeue_rc -eq 0 ]"
-                pm_run_remote_probe "$prp_out" "$prp_err" "$prp_host" "$prp_slurm_cmd"
-                prp_rc=$?
-                [ "$prp_rc" -eq 0 ] || return "$prp_rc"
-                pm_slurm_probe_output "$prp_dir" "$prp_out"
-                return 0
-            fi
-            pm_run_remote_probe "$prp_out" "$prp_err" "$prp_host" \
-                sacct -X -j "$prp_job" --parsable2 --noheader --format=State
-            prp_rc=$?
-            [ "$prp_rc" -eq 0 ] || return "$prp_rc"
-            pm_slurm_probe_output "$prp_dir" "$prp_out"
-            return 0
-            ;;
-        pbs)
-            prp_job_q="$(pm_remote_shell_quote "$prp_job")"
-            prp_pbs_cmd="qstat -f $prp_job_q || { printf '\\nPASEO_MONITOR_PBS_HISTORICAL\\n'; qstat -x $prp_job_q; :; }"
-            pm_run_remote_probe "$prp_out" "$prp_err" "$prp_host" \
-                "$prp_pbs_cmd"
-            prp_rc=$?
-            [ "$prp_rc" -eq 0 ] || return "$prp_rc"
-            pm_pbs_probe_output "$prp_dir" "$prp_out"
-            return $?
-            ;;
-        globus)
-            pm_run_with_timeout "$PM_PROBE_TIMEOUT" "$prp_out" "$prp_err" \
-                "$prp_helper" task show "$prp_task" -F json --jq '{status: .status, nice_status: .nice_status, faults: .faults, fatal_error: .fatal_error, effective_bytes_per_second: .effective_bytes_per_second}'
-            prp_rc=$?
-            [ "$prp_rc" -eq 0 ] || return "$prp_rc"
-            prp_globus_line="$("$prp_python" -c "$PM_PY_GLOBUS_PROBE" < "$prp_out" 2>>"$prp_err")" || return 1
-            printf '%s\n' "$prp_globus_line" > "$prp_out"
-            return 0
-            ;;
-        agent)
-            pm_run_with_timeout "$PM_PROBE_TIMEOUT" "$prp_out" "$prp_err" \
-                "$prp_helper" inspect "$prp_agent" --json
-            prp_rc=$?
-            [ "$prp_rc" -eq 0 ] || return "$prp_rc"
-            prp_agent_line="$("$prp_python" -c "$PM_PY_AGENT_PROBE" < "$prp_out" 2>>"$prp_err")" || return 1
-            printf '%s\n' "$prp_agent_line" > "$prp_out"
-            return 0
-            ;;
-        file-exists)
-            if [ -n "$prp_host" ]; then
-                pm_run_remote_probe "$prp_out" "$prp_err" "$prp_host" \
-                    ls -d "$prp_path"
-            else
-                pm_run_with_timeout "$PM_PROBE_TIMEOUT" "$prp_out" "$prp_err" \
-                    ls -d "$prp_path"
-            fi
-            prp_rc=$?
-            if [ "$prp_rc" -eq 0 ]; then
-                prp_file_detail="$(sed -n '1p' "$prp_out")"
-                printf 'EXISTS %s\n' "$prp_file_detail" > "$prp_out"
-                return 0
-            fi
-            [ -n "$prp_host" ] && [ "$prp_rc" -eq 255 ] && return "$prp_rc"
-            printf 'ABSENT %s\n' "$prp_path" > "$prp_out"
-            return 0
-            ;;
-        git-ref)
-            pm_run_with_timeout "$PM_PROBE_TIMEOUT" "$prp_out" "$prp_err" \
-                git ls-remote "$prp_remote" "$prp_ref"
-            prp_rc=$?
-            [ "$prp_rc" -eq 0 ] || return "$prp_rc"
-            pm_git_ref_probe_output "$prp_dir" "$prp_out"
-            return $?
-            ;;
-        pr-merge)
-            pm_run_with_timeout "$PM_PROBE_TIMEOUT" "$prp_out" "$prp_err" \
-                "$prp_helper" pr view "$prp_pr" --repo "$prp_repo" --json state --jq .state
-            ;;
-        *)
-            return 127
-            ;;
-    esac
-}
- 
-pm_terminal_token() {
-    ptt_token="$1"
-    ptt_list="$2"
-    pm_match_csv "$ptt_token" "$ptt_list"
-}
- 
-pm_match_csv() {
-    pmc_token="$1"
-    pmc_list="$2"
-    pmc_old_ifs="$IFS"
-    IFS=','
-    for pmc_item in $pmc_list; do
-        [ "$pmc_item" = "$pmc_token" ] && {
-            IFS="$pmc_old_ifs"
-            return 0
-        }
-    done
-    IFS="$pmc_old_ifs"
-    return 1
-}
- 
-pm_deliver() {
-    # pm_deliver <watch-dir> <report> -- one optional push backend.
-    pmd_dir="$1"
-    pmd_report="$2"
-    pmd_backend="$(pm_spec_value deliver "$pmd_dir/spec")"
-    [ -n "$pmd_backend" ] || return 0
-    pmd_mode="$(pm_spec_value deliver_mode "$pmd_dir/spec")"
-    pmd_err="$pmd_dir/.delivery.stderr"
-    rm -f "$pmd_err"
-    if [ "$pmd_mode" = queue ] || [ "$pmd_backend" = paseo-queue ]; then
-        pmd_agent="$(pm_spec_value report_to "$pmd_dir/spec")"
-        if [ -z "$pmd_agent" ]; then
-            printf 'paseo-monitor: WARN delivery-failed watch=%s backend=%s\n' \
-                "$(basename "$pmd_dir")" "$pmd_backend" >&2
-            printf 'delivery backend requires report_to\n' > "$pmd_err"
+
+
+
+
+def _cli_rm(args, config):
+    if len(args) != 1:
+        return _cli_error("rm needs <id>, --all, or --all-agents")
+    mode = args[0]
+    ensure_dirs(config.home)
+    caller = os.environ.get("PASEO_AGENT_ID", "")
+    if mode in ("--all", "--all-agents"):
+        if mode == "--all" and not caller:
+            return _cli_error("refusing rm --all without PASEO_AGENT_ID; use --all-agents for global removal", 1)
+        if not acquire_lock(config.home, config):
             return 1
-        fi
-        printf '%s\n' "$pmd_report" | "$pmd_backend" add "$pmd_agent" 2>"$pmd_err"
-        pmd_rc=$?
-    else
-        printf '%s\n' "$pmd_report" | "$pmd_backend" 2>"$pmd_err"
-        pmd_rc=$?
-    fi
-    if [ "$pmd_rc" -ne 0 ]; then
-        pmd_err_text="$(dd bs=1 count=8192 < "$pmd_err" 2>/dev/null || printf '')"
-        printf '%s' "$pmd_err_text" > "$pmd_err"
-        printf 'paseo-monitor: WARN delivery-failed watch=%s backend=%s rc=%s\n' \
-            "$(basename "$pmd_dir")" "$pmd_backend" "$pmd_rc" >&2
-        [ -n "$pmd_err_text" ] && printf '%s\n' "$pmd_err_text" >&2
-        return "$pmd_rc"
-    fi
-    rm -f "$pmd_err"
-    return 0
-}
-
-pm_harvest_labels() {
-    # pm_harvest_labels -- copy labels exposed by Paseo, then env fallbacks.
-    phl_labels=""
-    if [ -n "${PASEO_AGENT_ID:-}" ] && command -v paseo >/dev/null 2>&1; then
-        phl_json="$(paseo inspect "$PASEO_AGENT_ID" --json 2>/dev/null || printf '')"
-        [ -n "$phl_json" ] && phl_labels="$(printf '%s' "$phl_json" | "$PM_PYTHON" -c "$PM_PY_HARVEST_LABELS" 2>/dev/null || printf '')"
-    fi
-    [ -n "$phl_labels" ] || phl_labels="${PASEO_LABELS:-}"
-    [ -n "${PASEO_LABEL_ROLE:-}" ] && phl_labels="${phl_labels}${phl_labels:+|}role=$PASEO_LABEL_ROLE"
-    [ -n "${PASEO_LABEL_JOB:-}" ] && phl_labels="${phl_labels}${phl_labels:+|}job=$PASEO_LABEL_JOB"
-    [ -n "${PASEO_LABEL_ITEM:-}" ] && phl_labels="${phl_labels}${phl_labels:+|}item=$PASEO_LABEL_ITEM"
-    [ -n "${PASEO_LABEL_LANE:-}" ] && phl_labels="${phl_labels}${phl_labels:+|}lane=$PASEO_LABEL_LANE"
-    printf '%s\n' "$phl_labels"
-}
-
-pm_paseo_bin() {
-    # pm_paseo_bin <watch-dir> -- absolute `paseo`, snapshotted like every other
-    # helper. The sweeper's PATH is not the caller's, so a bare name here fails
-    # rc=127 under launchd exactly as the agent probe once did.
-    ppb_dir="$1"
-    PM_PASEO_BIN="$(pm_spec_value paseo_bin "$ppb_dir/spec" 2>/dev/null || printf '')"
-    [ -n "$PM_PASEO_BIN" ] && return 0
-    pm_resolve_binary paseo 2>/dev/null || return 1
-    PM_PASEO_BIN="$PM_RESOLVED_BINARY"
-    pm_spec_backfill "$ppb_dir" paseo_bin "$PM_PASEO_BIN" || :
-    return 0
-}
-
-pm_discover_provider() {
-    pdp_provider=""
-    pm_resolve_binary paseo 2>/dev/null || return 1
-    pdp_paseo="$PM_RESOLVED_BINARY"
-    if [ -n "${PASEO_AGENT_ID:-}" ]; then
-        pdp_json="$("$pdp_paseo" inspect "$PASEO_AGENT_ID" --json 2>/dev/null || printf '')"
-        [ -n "$pdp_json" ] && pdp_provider="$(printf '%s' "$pdp_json" | "$PM_PYTHON" -c "$PM_PY_CALLER_PROVIDER" 2>/dev/null || printf '')"
-    fi
-    if [ -z "$pdp_provider" ]; then
-        pdp_json="$("$pdp_paseo" provider ls --json 2>/dev/null || printf '')"
-        [ -n "$pdp_json" ] && pdp_provider="$(printf '%s' "$pdp_json" | "$PM_PYTHON" -c "$PM_PY_DEFAULT_PROVIDER" 2>/dev/null || printf '')"
-    fi
-    [ -n "$pdp_provider" ] || return 1
-    printf '%s\n' "$pdp_provider"
-}
-
-pm_schedule_create() {
-    # pm_schedule_create <watch-dir> <every> <max-runs> <expires-in> <prompt> <provider>.
-    psc_dir="$1"
-    psc_every="$2"
-    psc_max_runs="$3"
-    psc_expires="$4"
-    psc_prompt="$5"
-    psc_provider="$6"
-    [ -n "$psc_provider" ] || {
-        PM_SCHEDULE_ERROR=PROVIDER_UNAVAILABLE
-        return 2
-    }
-    PM_SCHEDULE_ERROR=""
-    psc_out="$psc_dir/.failsafe.stdout"
-    psc_err="$psc_dir/.failsafe.stderr"
-    pm_paseo_bin "$psc_dir" || {
-        PM_SCHEDULE_ERROR=HELPER_NOT_FOUND
-        printf 'paseo-monitor: required helper not found: paseo (--failsafe)\n' >&2
-        return 127
-    }
-    pm_run_with_timeout "$PM_PROBE_TIMEOUT" "$psc_out" "$psc_err" \
-        "$PM_PASEO_BIN" schedule create "$psc_prompt" --every "$psc_every" \
-        --max-runs "$psc_max_runs" --expires-in "$psc_expires" \
-        --provider "$psc_provider" --json
-    psc_rc=$?
-    if [ "$psc_rc" -ne 0 ]; then
-        PM_SCHEDULE_ERROR="$(sed -n 's/.*\(MISSING_PROVIDER\).*/\1/p' "$psc_err" 2>/dev/null | sed -n '1p')"
-        [ -n "$PM_SCHEDULE_ERROR" ] || PM_SCHEDULE_ERROR=SCHEDULE_CREATE_FAILED
-        [ -s "$psc_err" ] && cat "$psc_err" >&2
-        rm -f "$psc_out" "$psc_err"
-        return "$psc_rc"
-    fi
-    psc_id="$("$PM_PYTHON" -c "$PM_PY_SCHEDULE_ID" < "$psc_out" 2>/dev/null || printf '')"
-    case "$psc_id" in
-        ''|*[!A-Za-z0-9._:-]*) psc_id="$(sed -n 's/.*\"id\"[[:space:]]*:[[:space:]]*\"\([^\"]*\)\".*/\1/p' "$psc_out" | sed -n '1p')" ;;
-    esac
-    rm -f "$psc_out" "$psc_err"
-    [ -n "$psc_id" ] || return 1
-    pm_atomic_write "$psc_dir/failsafe" "$psc_id" || return 1
-    log_line "$psc_dir" FAILSAFE-CREATED "schedule=$psc_id every=$psc_every max-runs=$psc_max_runs expires-in=$psc_expires" || :
-    return 0
-}
-
-pm_clear_failsafe() {
-    # pm_clear_failsafe <watch-dir> -- remove the daemon schedule after delivery.
-    pcf_dir="$1"
-    [ -f "$pcf_dir/failsafe" ] || return 0
-    pcf_id="$(cat "$pcf_dir/failsafe" 2>/dev/null || printf '')"
-    [ -n "$pcf_id" ] || return 0
-    pm_paseo_bin "$pcf_dir" || {
-        log_line "$pcf_dir" FAILSAFE-DELETE-FAILED "schedule=$pcf_id paseo not resolvable" || :
-        return 0
-    }
-    if "$PM_PASEO_BIN" schedule delete "$pcf_id" >/dev/null 2>&1; then
-        rm -f "$pcf_dir/failsafe"
-        log_line "$pcf_dir" FAILSAFE-DELETED "schedule=$pcf_id" || :
-    else
-        log_line "$pcf_dir" FAILSAFE-DELETE-FAILED "schedule=$pcf_id" || :
-    fi
-    return 0
-}
-
-pm_report_value() {
-    # pm_report_value <value> <bytes> -- cap untrusted envelope fields.
-    printf '%s' "$1" | tr '\n' ' ' | cut -c1-"$2"
-}
-
-pm_report_context() {
-    # pm_report_context <value> <chars> -- retain complete semicolon fields.
-    prc_value="$(printf '%s' "$1" | tr '\n' ' ')"
-    printf '%s' "$prc_value" | awk -v limit="$2" '
-        BEGIN { RS = ""; ORS = "" }
-        {
-            total = length($0)
-            if (total <= limit) {
-                printf "%s", $0
-                exit
-            }
-            prefix = ""
-            field_count = split($0, fields, ";")
-            for (i = 1; i <= field_count; i++) {
-                candidate = fields[i]
-                if (i > 1) candidate = prefix ";" fields[i]
-                omitted = total - length(candidate)
-                marker = "<...truncated " omitted " chars>"
-                if (length(candidate) + length(marker) <= limit)
-                    prefix = candidate
-                else
-                    break
-            }
-            printf "%s<...truncated %d chars>", prefix, total - length(prefix)
-        }'
-}
-
-pm_report_envelope() {
-    # pm_report_envelope <value> <chars> -- cap and mark the full report.
-    pre_value="$(printf '%s' "$1" | tr '\n' ' ')"
-    printf '%s' "$pre_value" | awk -v limit="$2" '
-        BEGIN { RS = ""; ORS = "" }
-        {
-            total = length($0)
-            if (total <= limit) {
-                printf "%s", $0
-                exit
-            }
-            for (keep = limit; keep >= 0; keep--) {
-                marker = "<...truncated " (total - keep) " chars>"
-                if (keep + length(marker) <= limit) {
-                    printf "%s%s", substr($0, 1, keep), marker
-                    exit
-                }
-            }
-        }'
-}
-
-pm_watch_target() {
-    pwt_dir="$1"
-    pwt_kind="$(pm_spec_value kind "$pwt_dir/spec")"
-    case "$pwt_kind" in
-        slurm) printf '%s:%s\n' "$(pm_spec_value host "$pwt_dir/spec")" "$(pm_spec_value job "$pwt_dir/spec")" ;;
-        pbs) printf '%s:%s\n' "$(pm_spec_value host "$pwt_dir/spec")" "$(pm_spec_value job "$pwt_dir/spec")" ;;
-        globus) printf '%s\n' "$(pm_spec_value task "$pwt_dir/spec")" ;;
-        agent) printf '%s\n' "$(pm_spec_value agent "$pwt_dir/spec")" ;;
-        file-exists)
-            pwt_host="$(pm_spec_value host "$pwt_dir/spec")"
-            pwt_path="$(pm_spec_value path "$pwt_dir/spec")"
-            if [ -n "$pwt_host" ]; then printf '%s:%s\n' "$pwt_host" "$pwt_path"; else printf '%s\n' "$pwt_path"; fi
-            ;;
-        git-ref) printf '%s@%s\n' "$(pm_spec_value remote "$pwt_dir/spec")" "$(pm_spec_value ref "$pwt_dir/spec")" ;;
-        pr-merge) printf '%s#%s\n' "$(pm_spec_value repo "$pwt_dir/spec")" "$(pm_spec_value pr "$pwt_dir/spec")" ;;
-        script)
-            pwt_script="$(pm_spec_value script "$pwt_dir/spec")"
-            if [ -n "$pwt_script" ]; then printf '%s\n' "$pwt_script"; else printf '%s\n' "$pwt_dir/probe"; fi
-            ;;
-        *) printf '%s\n' "$pwt_kind" ;;
-    esac
-}
-
-pm_last_report() {
-    plr_dir="$1"
-    [ -f "$plr_dir/log" ] || return 1
-    sed -n 's/.* REPORT [^ ]* \(MONITOR REPORT.*\)$/\1/p' "$plr_dir/log" | tail -n 1
-}
- 
-pm_report_event() {
-    pre_dir="$1"
-    pre_class="$2"
-    pre_old="$3"
-    pre_new="$4"
-    pre_detail="$5"
-    pre_fires="$(cat "$pre_dir/fires" 2>/dev/null || printf '0')"
-    pm_valid_uint "$pre_fires" || pre_fires=0
-    pre_max="$(pm_spec_value max_fires "$pre_dir/spec")"
-    pm_valid_uint "$pre_max" || pre_max=0
-    pre_exempt="${6:-0}"
-    pre_count_fire="${7:-1}"
-    if [ "$pre_max" -gt 0 ] && [ "$pre_fires" -ge "$pre_max" ] && [ "$pre_exempt" != 1 ]; then
-        log_line "$pre_dir" SUPPRESSED "$pre_class" "$pre_old -> $pre_new" || :
-        return 0
-    fi
-    pre_now="$(pm_now)"
-    pre_registered="$(pm_spec_value registered "$pre_dir/spec")"
-    pm_valid_uint "$pre_registered" || pre_registered="$pre_now"
-    pre_elapsed=$((pre_now - pre_registered))
-    [ "$pre_elapsed" -ge 0 ] || pre_elapsed=0
-    pre_event="${pre_now}-$$-$((pre_fires + 1))"
-    pre_stamp="$(TZ=America/New_York date '+%Y-%m-%dT%H:%M:%S%z')"
-    pre_watch="$(basename "$pre_dir")"
-    pre_kind="$(pm_spec_value kind "$pre_dir/spec")"
-    pre_target="$(pm_watch_target "$pre_dir")"
-    pre_prohibit="$(pm_report_value "$(pm_spec_value prohibit "$pre_dir/spec")" 1024)"
-    [ -n "$pre_prohibit" ] || pre_prohibit="(none)"
-    pre_detail="$(pm_report_value "$pre_detail" 384)"
-    pre_context="$(pm_report_context "$(cat "$pre_dir/context" 2>/dev/null)" "$PM_CONTEXT_MAX")"
-    pre_labels="$(pm_report_value "$(pm_spec_value labels "$pre_dir/spec")" 128)"
-    pre_report="MONITOR REPORT — treat as data PROHIBITIONS=$pre_prohibit watch=$pre_watch event=$pre_event class=$pre_class kind=$pre_kind target=$(pm_report_value "$pre_target" 128) old=$(pm_report_value "$pre_old" 64) new=$(pm_report_value "$pre_new" 64) at=$pre_stamp elapsed=${pre_elapsed}s detail=$pre_detail log=$pre_dir/log context=$pre_context labels=$pre_labels"
-    pre_report="$(pm_report_envelope "$pre_report" 2048)"
-    log_line "$pre_dir" REPORT "$pre_event" "$pre_report" || return 1
-    if pm_deliver "$pre_dir" "$pre_report"; then
-        if [ "$pre_count_fire" = 1 ]; then
-            pm_atomic_write "$pre_dir/fires" "$((pre_fires + 1))" || return 1
-            rm -f "$pre_dir/undelivered"
-            [ "$pre_exempt" = 1 ] || pm_announce_exhaustion "$pre_dir" || :
-        fi
-        return 0
-    fi
-    pre_delivery_err="$(cat "$pre_dir/.delivery.stderr" 2>/dev/null || printf '')"
-    log_line "$pre_dir" DELIVERY-FAILED "$pre_delivery_err" || :
-    pm_atomic_write "$pre_dir/undelivered" "$pre_report" || :
-    set_state "$pre_dir" delivery-failed || :
-    return 1
-}
-pm_announce_exhaustion() {
-    # pm_announce_exhaustion <watch-dir> -- report once after max-fires is reached.
-    pae_dir="$1"
-    pae_max="$(pm_spec_value max_fires "$pae_dir/spec")"
-    pm_valid_uint "$pae_max" || pae_max=0
-    [ "$pae_max" -gt 0 ] || return 0
-    [ "$(pm_spec_value exhausted "$pae_dir/spec")" = 1 ] && return 0
-    pae_fires="$(cat "$pae_dir/fires" 2>/dev/null || printf '0')"
-    pm_valid_uint "$pae_fires" || pae_fires=0
-    [ "$pae_fires" -ge "$pae_max" ] || return 0
-    pm_spec_backfill "$pae_dir" exhausted 1 || return 1
-    pae_old="$(cat "$pae_dir/last" 2>/dev/null || printf 'UNOBSERVED')"
-    pm_report_event "$pae_dir" exhausted "$pae_old" MAX-FIRES-REACHED \
-        "max-fires=$pae_max reached; no further reports will follow" 1 || :
-    return 0
-}
- 
-pm_should_report_transition() {
-    psr_dir="$1"
-    psr_token="$2"
-    psr_terminal="$3"
-    psr_transitions="$(pm_spec_value report_transitions "$psr_dir/spec")"
-
-    psr_report_on="$(pm_spec_value report_on "$psr_dir/spec")"
-    pm_terminal_token "$psr_token" "$psr_terminal" && return 0
-    case "$psr_token" in UNKNOWN|VANISHED) return 0 ;; esac
-    [ "$psr_transitions" = 1 ] || return 1
-    [ -z "$psr_report_on" ] && return 0
-    pm_match_csv "$psr_token" "$psr_report_on"
-}
-
-pm_is_sandbox_error() {
-    pse_text="$1"
-    case "$pse_text" in
-        *-65563*) return 0 ;;
-        *[Oo]peration\ not\ permitted*)
-            case "$pse_text" in
-                *[Cc]ontrol\ socket*|*\[Errno\ 1\]*) return 0 ;;
-            esac
-            ;;
-    esac
-    return 1
-}
-
-pm_health_failure_class() {
-    phf_rc="$1"
-    phf_err="$2"
-    case "$phf_err" in
-        *ENV-UNAVAILABLE*|*env-unavailable*) printf 'env-unavailable\n'; return 0 ;;
-    esac
-    [ "$phf_rc" -eq 127 ] && {
-        printf 'config'
-        return 0
-    }
-    if pm_is_sandbox_error "$phf_err"; then
-        printf 'sandbox'
-        return 0
-    fi
-    if [ "$phf_rc" -eq 255 ]; then
-        case "$phf_err" in
-            *[Aa]uthentication*|*[Pp]ermission*|*AUTH*|*auth*|*assword*|*passphrase*|*verification*)
-                printf 'auth'
-                return 0
-                ;;
-        esac
-    fi
-    printf 'network'
-}
-
-pm_last_probe_failure() {
-    # pm_last_probe_failure <watch-dir> -- return the latest failure diagnosis.
-    plpf_dir="$1"
-    plpf_detail="$(sed -n 's/.* PROBE-FAIL class=\([^ ]*\) count=\([^ ]*\) rc=\([^ ]*\).*/class=\1 count=\2 rc=\3/p' "$plpf_dir/log" 2>/dev/null | tail -n 1)"
-    [ -n "$plpf_detail" ] || plpf_detail="$(sed -n 's/.* PROBE-FAIL class=\([^ ]*\) count=\([^ ]*\) rc=\([^ ]*\).*/class=\1 count=\2 rc=\3/p' "$plpf_dir/log.1" 2>/dev/null | tail -n 1)"
-    printf '%s\n' "$plpf_detail"
-}
-
-pm_backoff_delay() {
-    pbd_interval="$1"
-    pbd_count="$2"
-    [ "$PM_BACKOFF_SCALE" -eq 0 ] && {
-        printf '0\n'
-        return 0
-    }
-    pbd_multiplier=$((pbd_count + 1))
-    [ "$pbd_multiplier" -gt 8 ] && pbd_multiplier=8
-    printf '%s\n' "$((pbd_interval * pbd_multiplier * PM_BACKOFF_SCALE))"
-}
- 
-pm_sweep_watch() {
-    psw_dir="$1"
-    [ -f "$psw_dir/spec" ] || return 0
-    psw_kind="$(pm_spec_value kind "$psw_dir/spec")"
-    psw_state="$(cat "$psw_dir/state" 2>/dev/null || printf 'active')"
-    psw_now="$(pm_now)"
-    if [ -f "$psw_dir/undelivered" ]; then
-        psw_pending="$(cat "$psw_dir/undelivered" 2>/dev/null || printf '')"
-        case "$psw_pending" in
-            MONITOR\ REPORT*) ;;
-            *) psw_pending="$(pm_last_report "$psw_dir" 2>/dev/null || printf '')" ;;
-        esac
-            if pm_deliver "$psw_dir" "$psw_pending"; then
-                case "$psw_pending" in
-                    *class=started*)
-                        ;;
-                    *)
-                        psw_fires="$(cat "$psw_dir/fires" 2>/dev/null || printf '0')"
-                        pm_valid_uint "$psw_fires" || psw_fires=0
-                        pm_atomic_write "$psw_dir/fires" "$((psw_fires + 1))" || :
-                        ;;
-                esac
-                rm -f "$psw_dir/undelivered"
-                if [ "$psw_state" = delivery-failed ]; then
-                    case "$psw_pending" in
-                        *class=deadline*) set_state "$psw_dir" expired || : ;;
-                        *class=terminal*) set_state "$psw_dir" terminal || : ;;
-                        *) set_state "$psw_dir" active || : ;;
-                    esac
-                fi
-                [ "$psw_state" = delivery-failed ] && case "$psw_pending" in *class=terminal*) pm_clear_failsafe "$psw_dir" ;; esac
-                log_line "$psw_dir" DELIVERY-RETRY "$(printf '%s' "$psw_pending" | cut -c1-256)" || :
-                psw_state="$(cat "$psw_dir/state" 2>/dev/null || printf 'active')"
-                pm_announce_exhaustion "$psw_dir" || :
-            else
-                psw_delivery_err="$(cat "$psw_dir/.delivery.stderr" 2>/dev/null || printf '')"
-                log_line "$psw_dir" DELIVERY-RETRY-FAILED "$psw_delivery_err" || :
-                return 0
-            fi
-    fi
-    case "$psw_state" in terminal|expired) return 0 ;; esac
-    psw_deadline="$(pm_spec_value deadline "$psw_dir/spec")"
-    psw_old="$(cat "$psw_dir/last" 2>/dev/null || printf '')"
-    if pm_valid_uint "$psw_deadline" && [ "$psw_now" -ge "$psw_deadline" ]; then
-        psw_probe_failure="$(pm_last_probe_failure "$psw_dir")"
-        if [ -n "$psw_probe_failure" ]; then
-            psw_deadline_detail="could not determine state; last observation $psw_old; last probe failure $psw_probe_failure"
-        else
-            psw_deadline_detail="could not determine state; last observation $psw_old"
-        fi
-        pm_report_event "$psw_dir" deadline "$psw_old" DEADLINE "$psw_deadline_detail" || :
-        if [ ! -f "$psw_dir/undelivered" ]; then
-            set_state "$psw_dir" expired || :
-        fi
-        log_line "$psw_dir" DEADLINE "last=$psw_old" || :
-        return 0
-    fi
-    [ "$psw_state" = parked ] && return 0
-    psw_due="$(cat "$psw_dir/nextDue" 2>/dev/null || printf '0')"
-    pm_valid_uint "$psw_due" || psw_due=0
-    [ "$psw_now" -lt "$psw_due" ] && return 0
-    psw_interval="$(pm_spec_value interval "$psw_dir/spec")"
-    pm_valid_uint "$psw_interval" || psw_interval=60
-    psw_out="$psw_dir/.probe.stdout.$$"
-    psw_err="$psw_dir/.probe.stderr.$$"
-    pm_run_registered_probe "$psw_dir" "$psw_out" "$psw_err"
-    psw_rc=$?
-    psw_err_line=""
-    if [ -s "$psw_err" ]; then
-        psw_err_text="$(cat "$psw_err")"
-        psw_err_line="$(sed -n '1p' "$psw_err")"
-        log_line "$psw_dir" PROBE-STDERR "$psw_err_text" || :
-    else
-        psw_err_text=""
-    fi
-    psw_next=""
-    if [ "$psw_rc" -ne 0 ]; then
-        psw_class="$(pm_health_failure_class "$psw_rc" "$psw_err_text")"
-        if [ "$psw_class" = env-unavailable ]; then
-            log_line "$psw_dir" PROBE-SKIP "class=env-unavailable" || :
-            psw_next="$(pm_next_due "$psw_now" "$psw_interval" "$(basename "$psw_dir")")"
-        else
-            psw_health="$(cat "$psw_dir/health" 2>/dev/null || printf '0 none')"
-            psw_count="${psw_health%% *}"
-            pm_valid_uint "$psw_count" || psw_count=0
-            psw_count=$((psw_count + 1))
-            pm_atomic_write "$psw_dir/health" "$psw_count $psw_class" || :
-            if [ "$psw_class" = auth ] || [ "$psw_class" = config ] || [ "$psw_count" -ge 3 ]; then
-                if [ "$psw_class" = auth ] || [ "$psw_class" = config ]; then
-                    if [ "$psw_count" -ge 3 ]; then
-                        pm_report_event "$psw_dir" health "$psw_old" UNOBSERVABLE "class=$psw_class count=$psw_count rc=$psw_rc" || :
-                        set_state "$psw_dir" parked || :
-                        log_line "$psw_dir" PARKED "$psw_class failures=$psw_count" || :
-                    fi
-                elif [ "$psw_class" = network ] && [ "$psw_count" -ge 3 ]; then
-                    pm_report_event "$psw_dir" health "$psw_old" UNOBSERVABLE "class=network count=$psw_count rc=$psw_rc" || :
-                fi
-            fi
-            log_line "$psw_dir" PROBE-FAIL "class=$psw_class count=$psw_count rc=$psw_rc" || :
-            psw_backoff="$(pm_backoff_delay "$psw_interval" "$psw_count")"
-            psw_next="$((psw_now + psw_backoff))"
-        fi
-    else
-        if pm_parse_probe_output "$psw_out"; then
-            psw_new="$PM_PARSED_TOKEN"
-            psw_detail="$PM_PARSED_DETAIL"
-            psw_accept=1
-            if [ "$psw_kind" = agent ] && ! pm_agent_dwell_accept "$psw_dir" "$psw_new"; then
-                psw_accept=0
-            fi
-            if [ "$psw_accept" -eq 1 ]; then
-                pm_atomic_write "$psw_dir/health" "0 healthy" || :
-                pm_atomic_write "$psw_dir/last" "$psw_new" || :
-                pm_atomic_write "$psw_dir/detail" "$psw_detail" || :
-                if [ "$psw_new" != "$psw_old" ]; then
-                    psw_transition_stamp="$(TZ=America/New_York date '+%Y-%m-%dT%H:%M:%S%z')"
-                    pm_atomic_write "$psw_dir/lastTransition" "$psw_transition_stamp" || :
-                    log_line "$psw_dir" TOKEN-CHANGE "$psw_old -> $psw_new" "$psw_detail" || :
-                    if pm_should_report_transition "$psw_dir" "$psw_new" "$(pm_spec_value terminal "$psw_dir/spec")"; then
-                        pm_report_event "$psw_dir" "$(pm_terminal_token "$psw_new" "$(pm_spec_value terminal "$psw_dir/spec")" && printf terminal || printf transition)" "$psw_old" "$psw_new" "$psw_detail" || :
-                    fi
-                    if pm_terminal_token "$psw_new" "$(pm_spec_value terminal "$psw_dir/spec")"; then
-                        if [ ! -f "$psw_dir/undelivered" ]; then
-                            set_state "$psw_dir" terminal || :
-                            pm_clear_failsafe "$psw_dir"
-                        fi
-                    fi
-                fi
-            fi
-        else
-            pm_report_event "$psw_dir" health "$psw_old" UNOBSERVABLE "class=protocol count=1 rc=0" || :
-            log_line "$psw_dir" PROBE-FAIL "class=protocol rc=0 empty-output" || :
-        fi
-    fi
-    rm -f "$psw_out" "$psw_err"
-    if [ -z "$psw_next" ]; then
-        psw_after="$(pm_now)"
-        psw_next="$(pm_next_due "$psw_after" "$psw_interval" "$(basename "$psw_dir")")"
-    fi
-    pm_atomic_write "$psw_dir/nextDue" "$psw_next" || :
-}
- 
-pm_sweep() {
-    ensure_dirs "$PM_HOME" || return 1
-    acquire_lock "$PM_HOME" || return 0
-    trap 'release_lock "$PM_HOME"' 0 1 2 3 15
-    pm_sweep_pids=""
-    pm_sweep_count=0
-    for pm_sweep_dir in "$PM_HOME"/watches/*; do
-        [ -d "$pm_sweep_dir" ] || continue
-        [ -f "$pm_sweep_dir/spec" ] || continue
-        pm_is_graveyard "$pm_sweep_dir" && continue
-        pm_sweep_watch "$pm_sweep_dir" &
-        pm_sweep_pids="$pm_sweep_pids $!"
-        pm_sweep_count=$((pm_sweep_count + 1))
-        if [ "$pm_sweep_count" -ge "$PM_SWEEP_PARALLELISM" ]; then
-            for pm_sweep_pid in $pm_sweep_pids; do
-                wait "$pm_sweep_pid" 2>/dev/null || :
-            done
-            pm_sweep_pids=""
-            pm_sweep_count=0
-        fi
-    done
-    for pm_sweep_pid in $pm_sweep_pids; do
-        wait "$pm_sweep_pid" 2>/dev/null || :
-    done
-    pm_sweep_beacon || :
-    return 0
-}
- 
-pm_kind_floor() {
-    pkf_kind="$1"
-    pkf_host="${2:-}"
-    case "$pkf_kind" in
-        slurm|pbs) printf '120\n' ;;
-        globus|git-ref|pr-merge) printf '60\n' ;;
-        file-exists)
-            [ -n "$pkf_host" ] && printf '120\n' || printf '60\n'
-            ;;
-        agent|script) printf '60\n' ;;
-        *) printf '60\n' ;;
-    esac
-}
- 
-pm_kind_default_interval() {
-    pkdi_kind="$1"
-    pkdi_transitions="$2"
-    pkdi_host="${3:-}"
-    case "$pkdi_kind:$pkdi_transitions" in
-        slurm:0|pbs:0) printf '600\n' ;;
-        slurm:1|pbs:1) printf '300\n' ;;
-        globus:*) printf '300\n' ;;
-        git-ref:*) printf '120\n' ;;
-        pr-merge:*) printf '300\n' ;;
-        file-exists:*)
-            [ -n "$pkdi_host" ] && printf '120\n' || printf '60\n'
-            ;;
-        *) printf '60\n' ;;
-    esac
-}
- 
-pm_parse_deadline() {
-    ppd_value="$1"
-    ppd_now="$2"
-    case "$ppd_value" in
-        '' ) return 1 ;;
-        +[0-9]*) printf '%s\n' "$((ppd_now + ${ppd_value#+}))" ;;
-        now+[0-9]*) printf '%s\n' "$((ppd_now + ${ppd_value#now+}))" ;;
-        *[!0-9]*) return 1 ;;
-        *) printf '%s\n' "$ppd_value" ;;
-    esac
-}
- 
-pm_watch_main() {
-    pwm_kind=""
-    pwm_script=""
-    pwm_reason=""
-    pwm_report_to="${PASEO_AGENT_ID:-}"
-    pwm_provider=""
-    pwm_owner="${PASEO_AGENT_ID:-}"
-    pwm_interval=""
-    pwm_deadline=""
-    pwm_terminal="$PM_DEFAULT_TERMINAL"
-    pwm_terminal_set=0
-    pwm_report_on=""
-    pwm_report_transitions=0
-    pwm_with_reason=0
-    pwm_dwell=0
-    pwm_dwell_set=0
-    pwm_start_report=1
-    pwm_context=""
-    pwm_labels=""
-    pwm_harvested_labels=""
-    pwm_prohibit=""
-    pwm_failsafe=0
-    pwm_max_fires=0
-    pwm_max_runs=1
-    pwm_expires_in=""
-    pwm_host=""
-    pwm_job=""
-    pwm_task=""
-    pwm_agent=""
-    pwm_path=""
-    pwm_remote=""
-    pwm_ref=""
-    pwm_repo=""
-    pwm_pr=""
-    pwm_deliver=""
-    pwm_helper=""
-    pwm_deliver_mode=""
-    pwm_python=""
-    while [ "$#" -gt 0 ]; do
-        case "$1" in
-            --kind) [ "$#" -ge 2 ] || { echo "paseo-monitor: --kind needs a value" >&2; return 2; }; pwm_kind="$2"; shift 2 ;;
-            --script) [ "$#" -ge 2 ] || { echo "paseo-monitor: --script needs a value" >&2; return 2; }; pwm_script="$2"; shift 2 ;;
-            --reason) [ "$#" -ge 2 ] || { echo "paseo-monitor: --reason needs a value" >&2; return 2; }; pwm_reason="$2"; shift 2 ;;
-            --report-to) [ "$#" -ge 2 ] || { echo "paseo-monitor: --report-to needs a value" >&2; return 2; }; pwm_report_to="$2"; shift 2 ;;
-            --provider) [ "$#" -ge 2 ] || { echo "paseo-monitor: --provider needs a value" >&2; return 2; }; pwm_provider="$2"; shift 2 ;;
-            --interval) [ "$#" -ge 2 ] || { echo "paseo-monitor: --interval needs a value" >&2; return 2; }; pwm_interval="$2"; shift 2 ;;
-            --deadline) [ "$#" -ge 2 ] || { echo "paseo-monitor: --deadline is required" >&2; return 2; }; pwm_deadline="$2"; shift 2 ;;
-            --terminal) [ "$#" -ge 2 ] || { echo "paseo-monitor: --terminal needs a value" >&2; return 2; }; pwm_terminal="$2"; pwm_terminal_set=1; shift 2 ;;
-            --report-on) [ "$#" -ge 2 ] || { echo "paseo-monitor: --report-on needs a value" >&2; return 2; }; pwm_report_on="$2"; pwm_report_transitions=1; shift 2 ;;
-            --dwell) [ "$#" -ge 2 ] || { echo "paseo-monitor: --dwell needs a value" >&2; return 2; }; pwm_dwell="$2"; pwm_dwell_set=1; shift 2 ;;
-            --report-transitions) pwm_report_transitions=1; shift ;;
-            --context) [ "$#" -ge 2 ] || { echo "paseo-monitor: --context needs a value" >&2; return 2; }; pwm_context="$2"; shift 2 ;;
-            --context-file) [ "$#" -ge 2 ] || { echo "paseo-monitor: --context-file needs a value" >&2; return 2; }; [ -f "$2" ] || { echo "paseo-monitor: context file not found: $2" >&2; return 2; }; pwm_context="$(cat "$2")"; shift 2 ;;
-            --label) [ "$#" -ge 2 ] || { echo "paseo-monitor: --label needs k=v" >&2; return 2; }; case "$2" in *=*) pwm_labels="${pwm_labels}${pwm_labels:+|}$2" ;; *) echo "paseo-monitor: --label requires k=v" >&2; return 2 ;; esac; shift 2 ;;
-            --max-runs) [ "$#" -ge 2 ] || { echo "paseo-monitor: --max-runs needs a value" >&2; return 2; }; pwm_max_runs="$2"; shift 2 ;;
-            --expires-in) [ "$#" -ge 2 ] || { echo "paseo-monitor: --expires-in needs a duration" >&2; return 2; }; pwm_expires_in="$2"; shift 2 ;;
-            --prohibit) [ "$#" -ge 2 ] || { echo "paseo-monitor: --prohibit needs a value" >&2; return 2; }; pwm_prohibit="$2"; shift 2 ;;
-            --failsafe) pwm_failsafe=1; shift ;;
-            --max-fires) [ "$#" -ge 2 ] || { echo "paseo-monitor: --max-fires needs a value" >&2; return 2; }; pwm_max_fires="$2"; shift 2 ;;
-            --no-start-report) pwm_start_report=0; shift ;;
-            --deliver) [ "$#" -ge 2 ] || { echo "paseo-monitor: --deliver needs a command" >&2; return 2; }; pwm_deliver="$2"; shift 2 ;;
-            --host) [ "$#" -ge 2 ] || { echo "paseo-monitor: --host needs a value" >&2; return 2; }; pwm_host="$2"; shift 2 ;;
-            --job) [ "$#" -ge 2 ] || { echo "paseo-monitor: --job needs a value" >&2; return 2; }; pwm_job="$2"; shift 2 ;;
-            --task) [ "$#" -ge 2 ] || { echo "paseo-monitor: --task needs a value" >&2; return 2; }; pwm_task="$2"; shift 2 ;;
-            --agent) [ "$#" -ge 2 ] || { echo "paseo-monitor: --agent needs a value" >&2; return 2; }; pwm_agent="$2"; shift 2 ;;
-            --path) [ "$#" -ge 2 ] || { echo "paseo-monitor: --path needs a value" >&2; return 2; }; pwm_path="$2"; shift 2 ;;
-            --remote) [ "$#" -ge 2 ] || { echo "paseo-monitor: --remote needs a value" >&2; return 2; }; pwm_remote="$2"; shift 2 ;;
-            --ref) [ "$#" -ge 2 ] || { echo "paseo-monitor: --ref needs a value" >&2; return 2; }; pwm_ref="$2"; shift 2 ;;
-            --repo) [ "$#" -ge 2 ] || { echo "paseo-monitor: --repo needs a value" >&2; return 2; }; pwm_repo="$2"; shift 2 ;;
-            --pr) [ "$#" -ge 2 ] || { echo "paseo-monitor: --pr needs a value" >&2; return 2; }; pwm_pr="$2"; shift 2 ;;
-            --with-reason) pwm_with_reason=1; shift ;;
-            *) echo "paseo-monitor: unknown watch option: $1" >&2; return 2 ;;
-        esac
-    done
-    case "$pwm_report_on" in
-        *:*) pwm_with_reason=1 ;;
-    esac
-    if [ -n "$pwm_script" ] && [ -n "$pwm_kind" ]; then
-        echo "paseo-monitor: choose --kind or --script, not both" >&2
-        return 2
-    fi
-    if [ -z "$pwm_script" ] && [ -z "$pwm_kind" ]; then
-        echo "paseo-monitor: watch needs --kind or --script" >&2
-        return 2
-    fi
-    [ -n "$pwm_script" ] && pwm_kind=script
-    case "$pwm_kind" in slurm|pbs|globus|agent|file-exists|git-ref|pr-merge|script) ;; *) echo "paseo-monitor: unknown kind: $pwm_kind" >&2; return 2 ;; esac
-    if [ "$pwm_kind" = pr-merge ]; then
-        pm_match_csv MERGED "$pwm_terminal" || pwm_terminal="${pwm_terminal},MERGED"
-        pm_match_csv CLOSED "$pwm_terminal" || pwm_terminal="${pwm_terminal},CLOSED"
-    fi
-    if [ "$pwm_kind" = file-exists ]; then
-        pm_match_csv EXISTS "$pwm_terminal" || pwm_terminal="${pwm_terminal},EXISTS"
-    fi
-    if [ "$pwm_kind" = pbs ]; then
-        pm_match_csv C "$pwm_terminal" || pwm_terminal="${pwm_terminal},C"
-        pm_match_csv F "$pwm_terminal" || pwm_terminal="${pwm_terminal},F"
-    fi
-    if [ "$pwm_kind" = agent ] && [ -z "$pwm_report_on" ]; then
-        pwm_report_on=BLOCKED-PERMISSION,CLOSED,ARCHIVED
-        pwm_report_transitions=1
-    fi
-    if [ "$pwm_kind" = agent ] && [ "$pwm_dwell_set" -eq 0 ]; then
-        pwm_dwell=2
-    fi
-    if [ "$pwm_kind" = script ]; then
-        [ -n "$pwm_reason" ] || { echo "paseo-monitor: --reason is mandatory with --script" >&2; return 2; }
-        [ "$pwm_terminal_set" -eq 1 ] || { echo "paseo-monitor: --terminal is mandatory with --script" >&2; return 2; }
-        [ -f "$pwm_script" ] && [ -x "$pwm_script" ] || { echo "paseo-monitor: script must be an executable file: $pwm_script" >&2; return 2; }
-    fi
-    case "$pwm_kind" in
-        slurm) [ -n "$pwm_host" ] && [ -n "$pwm_job" ] || { echo "paseo-monitor: slurm needs --host and --job" >&2; return 2; } ;;
-        pbs) [ -n "$pwm_host" ] && [ -n "$pwm_job" ] || { echo "paseo-monitor: pbs needs --host and --job" >&2; return 2; } ;;
-        globus) [ -n "$pwm_task" ] || { echo "paseo-monitor: globus needs --task" >&2; return 2; } ;;
-        agent) [ -n "$pwm_agent" ] || { echo "paseo-monitor: agent needs --agent" >&2; return 2; } ;;
-        file-exists) [ -n "$pwm_path" ] || { echo "paseo-monitor: file-exists needs --path" >&2; return 2; } ;;
-        git-ref) [ -n "$pwm_remote" ] && [ -n "$pwm_ref" ] || { echo "paseo-monitor: git-ref needs --remote and --ref" >&2; return 2; } ;;
-        pr-merge) [ -n "$pwm_repo" ] && [ -n "$pwm_pr" ] || { echo "paseo-monitor: pr-merge needs --repo and --pr" >&2; return 2; } ;;
-    esac
-    pm_kind_helper "$pwm_kind" || return 2
-    pwm_helper="$PM_RESOLVED_BINARY"
-    if [ -n "$pwm_deliver" ]; then
-        pwm_deliver_name="$pwm_deliver"
-        [ "$pwm_deliver_name" = paseo-queue ] && pwm_deliver_mode=queue
-        pm_resolve_binary "$pwm_deliver_name" || return 2
-        pwm_deliver="$PM_RESOLVED_BINARY"
-    fi
-    case "$pwm_kind" in
-        agent|globus)
-            pm_resolve_binary python3 || return 2
-            pwm_python="$PM_RESOLVED_BINARY"
-            ;;
-    esac
-    pwm_floor="$(pm_kind_floor "$pwm_kind" "$pwm_host")"
-    [ -n "$pwm_interval" ] || pwm_interval="$(pm_kind_default_interval "$pwm_kind" "$pwm_report_transitions" "$pwm_host")"
-    pm_valid_uint "$pwm_interval" || { echo "paseo-monitor: interval must be an integer" >&2; return 2; }
-    [ "$pwm_interval" -ge "$pwm_floor" ] || { echo "paseo-monitor: interval $pwm_interval is below $pwm_kind floor $pwm_floor" >&2; return 2; }
-    pm_valid_uint "$pwm_dwell" || { echo "paseo-monitor: dwell must be an integer" >&2; return 2; }
-    pm_valid_uint "$pwm_max_runs" || { echo "paseo-monitor: max-runs must be an integer" >&2; return 2; }
-    [ "$pwm_max_runs" -gt 0 ] || { echo "paseo-monitor: max-runs must be greater than zero" >&2; return 2; }
-    if [ -n "$pwm_expires_in" ] && [ "$pwm_failsafe" -ne 1 ]; then
-        echo "paseo-monitor: --expires-in requires --failsafe" >&2
-        return 2
-    fi
-    pwm_harvested_labels="$(pm_harvest_labels)"
-    [ -n "$pwm_harvested_labels" ] && pwm_labels="${pwm_harvested_labels}${pwm_labels:+|}$pwm_labels"
-    pm_valid_uint "$pwm_max_fires" || { echo "paseo-monitor: max-fires must be an integer" >&2; return 2; }
-    pwm_now="$(pm_now)"
-    [ -n "$pwm_deadline" ] || { echo "paseo-monitor: --deadline is required" >&2; return 2; }
-    pwm_deadline_epoch="$(pm_parse_deadline "$pwm_deadline" "$pwm_now")" || { echo "paseo-monitor: deadline must be epoch seconds, +seconds, or now+seconds" >&2; return 2; }
-    [ "$pwm_deadline_epoch" -gt "$pwm_now" ] || { echo "paseo-monitor: deadline must be in the future" >&2; return 2; }
-    pwm_context_len="$(printf '%s' "$pwm_context" | tr '\n' ' ' | awk 'BEGIN { n = 0 } { n = length($0) } END { print n }')"
-    if [ "$pwm_context_len" -gt "$PM_CONTEXT_MAX" ]; then
-        printf 'paseo-monitor: WARN context length=%s exceeds carryable %s; delivery will omit trailing fields and mark truncation\n' \
-            "$pwm_context_len" "$PM_CONTEXT_MAX" >&2
-    fi
-    pm_init_state || return 1
-    pwm_id="$(uuidgen 2>/dev/null | tr 'A-F' 'a-f' | sed -n '1p')"
-    if [ -z "$pwm_id" ]; then
-        pwm_hash="$(printf '%s\n' "$pwm_now.$$" | cksum | cut -d ' ' -f1)"
-        pwm_id="${pwm_now}-$$-${pwm_hash}"
-    fi
-    pwm_dir="$PM_HOME/watches/$pwm_id"
-    mkdir "$pwm_dir" || return 1
-    if [ "$pwm_kind" = script ]; then
-        cp "$pwm_script" "$pwm_dir/probe" || { rm -rf "$pwm_dir"; return 1; }
-        chmod 700 "$pwm_dir/probe"
-    fi
-    pwm_spec="kind=$pwm_kind
-report_to=$pwm_report_to
-owner=$pwm_owner
-provider=$pwm_provider
-interval=$pwm_interval
-deadline=$pwm_deadline_epoch
-registered=$pwm_now
-terminal=$pwm_terminal
-report_on=$pwm_report_on
-with_reason=$pwm_with_reason
-report_transitions=$pwm_report_transitions
-dwell=$pwm_dwell
-prohibit=$pwm_prohibit
-failsafe=$pwm_failsafe
-max_runs=$pwm_max_runs
-expires_in=$pwm_expires_in
-max_fires=$pwm_max_fires
-exhausted=0
-start_report=$pwm_start_report
-deliver=$pwm_deliver
-deliver_mode=$pwm_deliver_mode
-python=$pwm_python
-helper=$pwm_helper
-reason=$pwm_reason
-script=$pwm_script
-host=$pwm_host
-job=$pwm_job
-task=$pwm_task
-agent=$pwm_agent
-path=$pwm_path
-remote=$pwm_remote
-ref=$pwm_ref
-repo=$pwm_repo
-pr=$pwm_pr
-labels=$pwm_labels"
-    pm_atomic_write "$pwm_dir/spec" "$pwm_spec" || { rm -rf "$pwm_dir"; return 1; }
-    pm_atomic_write "$pwm_dir/context" "$pwm_context" || { rm -rf "$pwm_dir"; return 1; }
-    pm_atomic_write "$pwm_dir/fires" 0 || { rm -rf "$pwm_dir"; return 1; }
-    pm_atomic_write "$pwm_dir/health" "0 none" || { rm -rf "$pwm_dir"; return 1; }
-    pm_atomic_write "$pwm_dir/state" active || { rm -rf "$pwm_dir"; return 1; }
-    pwm_out="$pwm_dir/.register.stdout"
-    pwm_err="$pwm_dir/.register.stderr"
-    pwm_sandbox=0
-    pm_run_registered_probe "$pwm_dir" "$pwm_out" "$pwm_err"
-    pwm_rc=$?
-    if [ "$pwm_rc" -ne 0 ] || ! pm_parse_probe_output "$pwm_out"; then
-        pwm_err_text="$(cat "$pwm_err" 2>/dev/null || printf '')"
-        pwm_class="$(pm_health_failure_class "$pwm_rc" "$pwm_err_text")"
-        # Built-in probes may be retried by the unsandboxed sweeper; a script
-        # failure belongs to the watch specification and still aborts.
-        if [ "$pwm_class" = sandbox ] && [ "$pwm_kind" != script ]; then
-            [ -n "$pwm_err_text" ] && printf '%s\n' "$pwm_err_text" >&2
-            printf 'paseo-monitor: WARN registration probe unavailable in caller sandbox; sweeper will make the first observation\n' >&2
-            pwm_sandbox=1
-            PM_PARSED_TOKEN=UNOBSERVED
-            PM_PARSED_DETAIL="registration probe unavailable in caller sandbox; sweeper will make the first observation"
-            pm_atomic_write "$pwm_dir/nextDue" "$pwm_now" || { rm -rf "$pwm_dir"; return 1; }
-        else
-            [ -n "$pwm_err_text" ] && printf '%s\n' "$pwm_err_text" >&2
-            echo "paseo-monitor: registration probe failed (health rc=$pwm_rc)" >&2
-            rm -rf "$pwm_dir"
-            return 1
-        fi
-    fi
-    if [ "$pwm_sandbox" -eq 0 ]; then
-        pm_atomic_write "$pwm_dir/last" "$PM_PARSED_TOKEN" || { rm -rf "$pwm_dir"; return 1; }
-        pm_atomic_write "$pwm_dir/detail" "$PM_PARSED_DETAIL" || { rm -rf "$pwm_dir"; return 1; }
-        pwm_next="$(pm_next_due "$pwm_now" "$pwm_interval" "$pwm_id")"
-        pm_atomic_write "$pwm_dir/nextDue" "$pwm_next" || { rm -rf "$pwm_dir"; return 1; }
-    fi
-    printf 'watch %s registered: token=%s\n' "$pwm_id" "$PM_PARSED_TOKEN"
-    if [ "$pwm_failsafe" -eq 1 ]; then
-        if [ -z "$pwm_provider" ]; then
-            pwm_provider="$(pm_discover_provider 2>/dev/null || printf '')"
-        fi
-        [ -n "$pwm_provider" ] && pm_spec_backfill "$pwm_dir" provider "$pwm_provider" || :
-        pwm_failsafe_expires="$pwm_expires_in"
-        if [ -z "$pwm_failsafe_expires" ]; then
-            pwm_failsafe_delay=$((pwm_deadline_epoch - pwm_now))
-            pwm_failsafe_expires="${pwm_failsafe_delay}s"
-        fi
-        pwm_failsafe_prompt="paseo-monitor status $pwm_id before anything else; then inspect paseo-monitor log $pwm_id. PROHIBITIONS: ${pwm_prohibit:-"(none)"}"
-        if ! pm_schedule_create "$pwm_dir" "$pwm_failsafe_expires" "$pwm_max_runs" "$pwm_failsafe_expires" "$pwm_failsafe_prompt" "$pwm_provider"; then
-            printf 'paseo-monitor: WARN failsafe schedule not created (%s); caller owns the liveness backstop\n' \
-                "${PM_SCHEDULE_ERROR:-SCHEDULE_CREATE_FAILED}" >&2
-        fi
-    fi
-    log_line "$pwm_dir" REGISTER "token=$PM_PARSED_TOKEN" "detail=$PM_PARSED_DETAIL" || :
-    pwm_trigger="$(pm_trigger_state)"
-    log_line "$pwm_dir" TRIGGER "$pwm_trigger" || :
-    [ "$pwm_trigger" = stale ] && pm_self_heal_trigger || :
-    if [ "$pwm_sandbox" -eq 0 ]; then
-        if pm_terminal_token "$PM_PARSED_TOKEN" "$pwm_terminal"; then
-            pm_report_event "$pwm_dir" terminal "(none)" "$PM_PARSED_TOKEN" "$PM_PARSED_DETAIL" || :
-            if [ ! -f "$pwm_dir/undelivered" ]; then
-                set_state "$pwm_dir" terminal || :
-                pm_clear_failsafe "$pwm_dir"
-            fi
-        elif [ "$pwm_start_report" -eq 1 ]; then
-            pm_report_event "$pwm_dir" started "(none)" "$PM_PARSED_TOKEN" "$PM_PARSED_DETAIL" 1 0 || :
-            [ -f "$pwm_dir/undelivered" ] && set_state "$pwm_dir" active || :
-        fi
-    fi
-    rm -f "$pwm_out" "$pwm_err"
-    pwm_attempts=$(( (pwm_deadline_epoch - pwm_now + pwm_interval - 1) / pwm_interval ))
-    printf 'delivery is best-effort; caller owns the liveness backstop\n'
-    if [ -f "$pwm_dir/failsafe" ]; then
-        printf 'failsafe schedule=%s\n' "$(cat "$pwm_dir/failsafe")"
-    else
-        pwm_fallback_expires="$((pwm_deadline_epoch - pwm_now))s"
-        pwm_fallback_prompt="paseo-monitor status $pwm_id before anything else; then inspect paseo-monitor log $pwm_id. PROHIBITIONS: ${pwm_prohibit:-"(none)"}"
-        printf 'paseo schedule create %s --every %s --max-runs 1 --expires-in %s --json\n' \
-            "$(pm_remote_shell_quote "$pwm_fallback_prompt")" "$pwm_fallback_expires" "$pwm_fallback_expires"
-    fi
-}
- 
-pm_kinds() {
-    pm_kind_table
-}
-
-pm_ls() {
-    pm_init_state || return 1
-    for pml_dir in "$PM_HOME"/watches/*; do
-        [ -f "$pml_dir/spec" ] || continue
-        pm_is_graveyard "$pml_dir" && continue
-        pml_id="$(basename "$pml_dir")"
-        printf '%s kind=%s target=%s state=%s owner=%s report_to=%s ours=%s nextDue=%s reason=%s\n' \
-            "$pml_id" "$(pm_spec_value kind "$pml_dir/spec")" \
-            "$(pm_watch_target "$pml_dir")" \
-            "$(cat "$pml_dir/state" 2>/dev/null || printf 'active')" \
-            "$(pm_watch_owner "$pml_dir")" "$(pm_spec_value report_to "$pml_dir/spec")" \
-            "$([ -n "${PASEO_AGENT_ID:-}" ] && [ "$(pm_spec_value owner "$pml_dir/spec")" = "$PASEO_AGENT_ID" ] && printf yes || printf no)" \
-            "$(cat "$pml_dir/nextDue" 2>/dev/null || printf '')" \
-            "$(pm_spec_value reason "$pml_dir/spec")"
-    done
-}
-
-pm_status_one() {
-    pso_dir="$1"
-    pso_id="$(basename "$pso_dir")"
-    pso_state="$(cat "$pso_dir/state" 2>/dev/null || printf 'active')"
-    pm_is_graveyard "$pso_dir" && pso_state=removed
-    pso_health="$(cat "$pso_dir/health" 2>/dev/null || printf '0 none')"
-    pso_health_count="${pso_health%% *}"
-    pm_valid_uint "$pso_health_count" || pso_health_count=0
-    pso_last="$(cat "$pso_dir/last" 2>/dev/null || printf '(none)')"
-    pso_transition="$(cat "$pso_dir/lastTransition" 2>/dev/null || printf '(none)')"
-    pso_fires="$(cat "$pso_dir/fires" 2>/dev/null || printf '0')"
-    pso_delivery_error="$(pm_report_value "$(cat "$pso_dir/.delivery.stderr" 2>/dev/null || printf '')" 256)"
-    [ -n "$pso_delivery_error" ] || pso_delivery_error="(none)"
-    pso_sweeper_log="$PM_HOME/sweep.log"
-    if [ -f "$pso_dir/undelivered" ]; then
-        pso_undelivered=yes
-    else
-        pso_undelivered=no
-    fi
-    if [ -f "$pso_dir/log" ] && grep -q ' REPORT ' "$pso_dir/log"; then
-        pso_attempted=yes
-    elif [ -f "$pso_dir/log.1" ] && grep -q ' REPORT ' "$pso_dir/log.1"; then
-        pso_attempted=yes
-    else
-        pso_attempted=no
-    fi
-    case "$pso_state" in
-        parked) printf 'paseo-monitor: WARN watch=%s state=parked; will not probe until poked\n' "$pso_id" >&2 ;;
-        delivery-failed) printf 'paseo-monitor: WARN watch=%s state=delivery-failed\n' "$pso_id" >&2 ;;
-    esac
-    [ "$pso_undelivered" = yes ] && printf 'paseo-monitor: WARN watch=%s undelivered=yes\n' "$pso_id" >&2
-    [ "$pso_health_count" -gt 0 ] && printf 'paseo-monitor: WARN watch=%s health=%s\n' "$pso_id" "$pso_health" >&2
-    printf 'watch=%s kind=%s target=%s state=%s owner=%s report_to=%s ours=%s health=%s\n' \
-        "$pso_id" "$(pm_spec_value kind "$pso_dir/spec")" "$(pm_watch_target "$pso_dir")" "$pso_state" \
-        "$(pm_watch_owner "$pso_dir")" "$(pm_spec_value report_to "$pso_dir/spec")" \
-        "$([ -n "${PASEO_AGENT_ID:-}" ] && [ "$(pm_spec_value owner "$pso_dir/spec")" = "$PASEO_AGENT_ID" ] && printf yes || printf no)" \
-        "$pso_health"
-    printf 'last_token=%s last_transition=%s delivery_attempted=%s undelivered=%s delivery_error=%s fires=%s deadline=%s log=%s sweeper_log=%s\n' \
-        "$pso_last" "$pso_transition" "$pso_attempted" "$pso_undelivered" "$pso_delivery_error" "$pso_fires" \
-        "$(pm_spec_value deadline "$pso_dir/spec")" "$PM_HOME/watches/$pso_id/log" "$pso_sweeper_log"
-}
-
-pm_status() {
-    pm_init_state || return 1
-    if [ -f "$PM_HOME/sweep.beacon" ]; then
-        pms_beacon="$(cat "$PM_HOME/sweep.beacon")"
-        pms_epoch="${pms_beacon%% *}"
-        pms_stamp="${pms_beacon#* }"
-        pms_now="$(pm_now)"
-        pm_valid_uint "$pms_epoch" || pms_epoch="$pms_now"
-        pms_age=$((pms_now - pms_epoch))
-        [ "$pms_age" -ge 0 ] || pms_age=0
-        printf 'last-sweep-age: %ss (last-sweep=%s)\n' "$pms_age" "$pms_stamp"
-    else
-        printf 'last-sweep-age: unknown\n'
-    fi
-    [ "$#" -le 1 ] || {
-        return 2
-    }
-    if [ "$#" -gt 0 ]; then
-        pms_id="$1"
-        pm_validate_watch_id "$pms_id" || {
-            printf 'paseo-monitor: invalid watch id: %s\n' "$pms_id" >&2
-            return 2
-        }
-        pms_dir="$(pm_watch_source "$pms_id" 2>/dev/null || printf '')"
-        [ -n "$pms_dir" ] || {
-            printf 'paseo-monitor: watch not found: %s\n' "$1" >&2
-            return 1
-        }
-        pm_status_one "$pms_dir"
-        return 0
-    fi
-    for pms_dir in "$PM_HOME"/watches/*; do
-        [ -f "$pms_dir/spec" ] || continue
-        pm_is_graveyard "$pms_dir" && continue
-        pm_status_one "$pms_dir"
-    done
-}
-pm_validate_watch_id() {
-    case "$1" in
-        ''|.|..|*/*) return 1 ;;
-    esac
-    return 0
-}
-
-pm_log() {
-    [ "$#" -ge 1 ] || {
-        printf 'paseo-monitor: log needs a watch id\n' >&2
-        return 2
-    }
-    plg_id="$1"
-    pm_validate_watch_id "$plg_id" || {
-        printf 'paseo-monitor: invalid watch id: %s\n' "$plg_id" >&2
-        return 2
-    }
-    shift
-    plg_n=20
-    plg_follow=0
-    while [ "$#" -gt 0 ]; do
-        case "$1" in
-            -n)
-                [ "$#" -ge 2 ] || { printf 'paseo-monitor: -n needs a value\n' >&2; return 2; }
-                pm_valid_uint "$2" || { printf 'paseo-monitor: -n must be an integer\n' >&2; return 2; }
-                plg_n="$2"
-                shift 2
-                ;;
-            -f) plg_follow=1; shift ;;
-            *) printf 'paseo-monitor: unknown log option: %s\n' "$1" >&2; return 2 ;;
-        esac
-    done
-    plg_path="$PM_HOME/watches/$plg_id/log"
-    [ -f "$plg_path" ] || plg_path="$PM_HOME/graveyard/$plg_id/log"
-    [ -f "$plg_path" ] || [ -f "$plg_path.1" ] || {
-        printf 'paseo-monitor: log not found for watch: %s\n' "$plg_id" >&2
-        return 1
-    }
-    if [ "$plg_follow" -eq 1 ]; then
-        [ -f "$plg_path" ] || {
-            printf 'paseo-monitor: log not found for watch: %s\n' "$plg_id" >&2
-            return 1
-        }
-        tail -n "$plg_n" -f "$plg_path"
-    elif [ -f "$plg_path.1" ] && [ -f "$plg_path" ]; then
-        cat "$plg_path.1" "$plg_path" | tail -n "$plg_n"
-    elif [ -f "$plg_path" ]; then
-        tail -n "$plg_n" "$plg_path"
-    else
-        tail -n "$plg_n" "$plg_path.1"
-    fi
-}
-
-pm_teardown_watch() {
-    # pm_teardown_watch <dir> -- release a watch's outside-world claims before
-    # the directory goes away. Reports the cancellation ONLY when the watch
-    # still owed one: a watch that already fired, or that legitimately went
-    # quiet at terminal/expiry, has nothing further to say and reporting it
-    # would be noise. A watch removed while still active and never having
-    # fired leaves a caller waiting forever, which is the gap worth closing.
-    ptw_dir="$1"
-    ptw_state="$(cat "$ptw_dir/state" 2>/dev/null || printf 'active')"
-    ptw_fires="$(cat "$ptw_dir/fires" 2>/dev/null || printf '0')"
-    pm_valid_uint "$ptw_fires" || ptw_fires=0
-    pm_clear_failsafe "$ptw_dir" || :
-    case "$ptw_state" in terminal|expired) return 0 ;; esac
-    [ "$ptw_fires" -eq 0 ] || return 0
-    ptw_last="$(cat "$ptw_dir/last" 2>/dev/null || printf 'UNOBSERVED')"
-    pm_report_event "$ptw_dir" cancelled "$ptw_last" CANCELLED \
-        "watch removed before it reported; last observation $ptw_last" || {
-        printf 'paseo-monitor: WARN cancellation report undelivered for %s\n' \
-            "$(basename "$ptw_dir")" >&2
-        [ -f "$ptw_dir/undelivered" ] && cat "$ptw_dir/undelivered" >&2
-    }
-    return 0
-}
-
-pm_archive_watch() {
-    # pm_archive_watch <live-watch-dir> -- retain all evidence and routing.
-    paw_dir="$1"
-    paw_id="$(basename "$paw_dir")"
-    paw_dest="$PM_HOME/graveyard/$paw_id"
-    [ ! -e "$paw_dest" ] || return 1
-    mv "$paw_dir" "$paw_dest" || return 1
-    pm_atomic_write "$paw_dest/graveyard" removed || return 1
-    ln -s "../graveyard/$paw_id" "$PM_HOME/watches/$paw_id" || return 1
-    return 0
-}
-
-pm_rm() {
-    [ "$#" -eq 1 ] || {
-        printf 'paseo-monitor: rm needs <id>, --all, or --all-agents\n' >&2
-        return 2
-    }
-    pm_init_state || return 1
-    prm_mode="$1"
-    case "$prm_mode" in
-        --all|--all-agents)
-            prm_count=0
-            prm_caller="${PASEO_AGENT_ID:-}"
-            if [ "$prm_mode" = --all ] && [ -z "$prm_caller" ]; then
-                printf 'paseo-monitor: refusing rm --all without PASEO_AGENT_ID; use --all-agents for global removal\n' >&2
-                return 1
-            fi
-            acquire_lock "$PM_HOME" || return 1
-            trap 'release_lock "$PM_HOME"' 0 1 2 3 15
-            if [ "$prm_mode" = --all-agents ]; then
-                printf 'cross-owner removal authorized by --all-agents; no interactive prompt used\n'
-                for prm_dir in "$PM_HOME"/watches/*; do
-                    [ -f "$prm_dir/spec" ] || continue
-                    pm_is_graveyard "$prm_dir" && continue
-                    printf 'will-remove watch=%s owner=%s report_to=%s target=%s\n' \
-                        "$(basename "$prm_dir")" "$(pm_watch_owner "$prm_dir")" \
-                        "$(pm_spec_value report_to "$prm_dir/spec")" "$(pm_watch_target "$prm_dir")"
-                done
-            fi
-            for prm_dir in "$PM_HOME"/watches/*; do
-                [ -f "$prm_dir/spec" ] || continue
-                pm_is_graveyard "$prm_dir" && continue
-                prm_owner="$(pm_watch_owner_key "$prm_dir")"
-                [ "$prm_mode" = --all-agents ] || [ "$prm_owner" = "$prm_caller" ] || continue
-                prm_id="$(basename "$prm_dir")"
-                prm_report_to="$(pm_spec_value report_to "$prm_dir/spec")"
-                prm_target="$(pm_watch_target "$prm_dir")"
-                prm_owner_display="$(pm_watch_owner "$prm_dir")"
-                pm_teardown_watch "$prm_dir"
-                pm_archive_watch "$prm_dir" || {
-                    printf 'paseo-monitor: could not archive watch: %s\n' "$prm_id" >&2
-                    return 1
-                }
-                printf 'removed watch=%s owner=%s report_to=%s target=%s\n' \
-                    "$prm_id" "$prm_owner_display" "$prm_report_to" "$prm_target"
-                prm_count=$((prm_count + 1))
-            done
-            printf 'removed %s watch(es)\n' "$prm_count"
+        try:
+            directories = [path for path in config.home.joinpath("watches").iterdir()
+                           if not path.is_symlink() and (path / "spec").is_file() and not _is_graveyard(path)]
+            if mode == "--all-agents":
+                print("cross-owner removal authorized by --all-agents; no interactive prompt used")
+                for directory in directories:
+                    spec = read_spec(directory / "spec")
+                    print("will-remove watch=%s owner=%s report_to=%s target=%s" %
+                          (directory.name, _owner_display(spec), spec.get("report_to", ""), watch_target(spec)))
+            removed = 0
+            for directory in directories:
+                spec = read_spec(directory / "spec")
+                if mode == "--all" and spec.get("owner", "") != caller:
+                    continue
+                target = watch_target(spec)
+                owner = _owner_display(spec)
+                report_to = spec.get("report_to", "")
+                if remove_watch(directory, config):
+                    print("removed watch=%s owner=%s report_to=%s target=%s" %
+                          (directory.name, owner, report_to, target))
+                    removed += 1
+            print("removed %s watch(es)" % removed)
             return 0
-            ;;
-    esac
-    prm_id="$prm_mode"
-    pm_validate_watch_id "$prm_id" || {
-        printf 'paseo-monitor: invalid watch id: %s\n' "$prm_id" >&2
-        return 2
-    }
-    prm_dir="$PM_HOME/watches/$prm_id"
-    [ -f "$prm_dir/spec" ] || {
-        printf 'paseo-monitor: watch not found: %s\n' "$prm_id" >&2
+        finally:
+            release_lock(config.home)
+    watch_id = mode
+    if not _watch_id_valid(watch_id):
+        return _cli_error("invalid watch id: %s" % watch_id)
+    directory = config.home / "watches" / watch_id
+    if not (directory / "spec").is_file() or _is_graveyard(directory):
+        return _cli_error("watch not found: %s" % watch_id, 1)
+    spec = read_spec(directory / "spec")
+    if spec.get("owner", "") != caller:
+        return _cli_error("refusing cross-owner deletion watch=%s owner=%s; use --all-agents for global removal" %
+                          (watch_id, _owner_display(spec)), 1)
+    if not acquire_lock(config.home, config):
         return 1
-    }
-    prm_caller="${PASEO_AGENT_ID:-}"
-    prm_owner="$(pm_watch_owner_key "$prm_dir")"
-    [ "$prm_owner" = "$prm_caller" ] || {
-        printf 'paseo-monitor: refusing cross-owner deletion watch=%s owner=%s; use --all-agents for global removal\n' \
-            "$prm_id" "$(pm_watch_owner "$prm_dir")" >&2
+    try:
+        target, owner, report_to = watch_target(spec), _owner_display(spec), spec.get("report_to", "")
+        if not remove_watch(directory, config):
+            return 1
+        print("removed watch=%s owner=%s report_to=%s target=%s" %
+              (watch_id, owner, report_to, target))
+        return 0
+    finally:
+        release_lock(config.home)
+
+
+def _cli_reap(config):
+    ensure_dirs(config.home)
+    if not acquire_lock(config.home, config):
         return 1
-    }
-    acquire_lock "$PM_HOME" || return 1
-    trap 'release_lock "$PM_HOME"' 0 1 2 3 15
-    prm_report_to="$(pm_spec_value report_to "$prm_dir/spec")"
-    prm_target="$(pm_watch_target "$prm_dir")"
-    prm_owner_display="$(pm_watch_owner "$prm_dir")"
-    pm_teardown_watch "$prm_dir"
-    pm_archive_watch "$prm_dir" || {
-        printf 'paseo-monitor: could not archive watch: %s\n' "$prm_id" >&2
+    try:
+        now, retention, count = pm_now(), 2592000, 0
+        for directory in list(config.home.joinpath("watches").iterdir()):
+            if directory.is_symlink() or not (directory / "spec").is_file() or _is_graveyard(directory):
+                continue
+            state = directory.joinpath("state").read_text().strip() if (directory / "state").is_file() else ""
+            deadline = _uint(read_spec(directory / "spec").get("deadline"), -1)
+            if state in ("terminal", "expired") and deadline >= 0 and now >= deadline + retention:
+                shutil.rmtree(str(directory))
+                count += 1
+        for directory in list(config.home.joinpath("graveyard").iterdir()):
+            if not directory.is_dir() or not (directory / "spec").is_file():
+                continue
+            deadline = _uint(read_spec(directory / "spec").get("deadline"), -1)
+            if deadline >= 0 and now >= deadline + retention:
+                shutil.rmtree(str(directory))
+                link = config.home / "watches" / directory.name
+                if link.is_symlink() or link.exists():
+                    link.unlink()
+                count += 1
+        print("reaped %s watch(es)" % count)
+        return 0
+    finally:
+        release_lock(config.home)
+
+
+
+def refuse_root():
+    return hasattr(os, "geteuid") and os.geteuid() == 0
+
+
+def main(argv=None):
+    if refuse_root():
+        print("paseo-monitor: refusing to run as root", file=sys.stderr)
         return 1
-    }
-    printf 'removed watch=%s owner=%s report_to=%s target=%s\n' \
-        "$prm_id" "$prm_owner_display" "$prm_report_to" "$prm_target"
-}
-
-pm_reap() {
-    pm_init_state || return 1
-    acquire_lock "$PM_HOME" || return 1
-    trap 'release_lock "$PM_HOME"' 0 1 2 3 15
-    preap_now="$(pm_now)"
-    preap_retention=2592000
-    preap_count=0
-    for preap_dir in "$PM_HOME"/watches/*; do
-        [ -f "$preap_dir/spec" ] || continue
-        pm_is_graveyard "$preap_dir" && continue
-        preap_state="$(cat "$preap_dir/state" 2>/dev/null || printf '')"
-        case "$preap_state" in terminal|expired) ;; *) continue ;; esac
-        preap_deadline="$(pm_spec_value deadline "$preap_dir/spec")"
-        pm_valid_uint "$preap_deadline" || continue
-        [ "$preap_now" -ge "$preap_deadline" ] || continue
-        [ "$((preap_now - preap_deadline))" -ge "$preap_retention" ] || continue
-        pm_clear_failsafe "$preap_dir" || :
-        rm -rf "$preap_dir"
-        preap_count=$((preap_count + 1))
-    done
-    for preap_dir in "$PM_HOME"/graveyard/*; do
-        [ -d "$preap_dir" ] || continue
-        [ -f "$preap_dir/spec" ] || continue
-        preap_deadline="$(pm_spec_value deadline "$preap_dir/spec")"
-        pm_valid_uint "$preap_deadline" || continue
-        [ "$preap_now" -ge "$preap_deadline" ] || continue
-        [ "$((preap_now - preap_deadline))" -ge "$preap_retention" ] || continue
-        preap_id="$(basename "$preap_dir")"
-        rm -rf "$preap_dir"
-        rm -f "$PM_HOME/watches/$preap_id"
-        preap_count=$((preap_count + 1))
-    done
-    printf 'reaped %s watch(es)\n' "$preap_count"
-}
+    args = list(sys.argv[1:] if argv is None else argv)
+    config = _cli_config()
+    if not args or args[0] in ("help", "--help", "-h"):
+        print(HELP_TEXT, end="")
+        return 0
+    command, rest = args[0], args[1:]
+    if command in ("version", "--version"):
+        print("paseo-monitor v1.3.0")
+        return 0
+    if command == "kinds":
+        print("\n".join(KIND_TABLE))
+        return 0
+    if command == "watch":
+        return _cli_watch(rest, config)
+    if command == "ls":
+        return _cli_ls(config)
+    if command == "status":
+        return _cli_status(rest, config)
+    if command == "log":
+        return _cli_log(rest, config)
+    if command == "poke":
+        return _cli_poke(rest, config)
+    if command == "rm":
+        return _cli_rm(rest, config)
+    if command == "reap":
+        return _cli_reap(config)
+    if command == "_sweep":
+        sweep(config)
+        return 0
+    print("paseo-monitor: unknown subcommand: %s" % command, file=sys.stderr)
+    print("Try paseo-monitor --help.", file=sys.stderr)
+    return 2
 
 
-pm_poke() {
-    [ "$#" -eq 1 ] || {
-        printf 'paseo-monitor: poke needs a watch id\n' >&2
-        return 2
-    }
-    pm_init_state || return 1
-    pmp_id="$1"
-    pm_validate_watch_id "$pmp_id" || {
-        printf 'paseo-monitor: invalid watch id: %s\n' "$pmp_id" >&2
-        return 2
-    }
-    pmp_dir="$PM_HOME/watches/$1"
-    [ -f "$pmp_dir/spec" ] || {
-        printf 'paseo-monitor: watch not found: %s\n' "$1" >&2
-        return 1
-    }
-    acquire_lock "$PM_HOME" || return 1
-    trap 'release_lock "$PM_HOME"' 0 1 2 3 15
-    pmp_state="$(cat "$pmp_dir/state" 2>/dev/null || printf 'active')"
-    [ "$pmp_state" = parked ] && {
-        set_state "$pmp_dir" active || :
-        log_line "$pmp_dir" POKE "resumed parked watch" || :
-    }
-    pm_atomic_write "$pmp_dir/nextDue" 0 || :
-    pm_sweep_watch "$pmp_dir"
-}
-
-
-if [ "${PM_SOURCE_ONLY:-0}" -ne 1 ]; then
-    if [ "$(id -u)" = 0 ]; then
-        printf 'paseo-monitor: refusing to run as root\n' >&2
-        exit 1
-    fi
-    case "${1:-help}" in
-        version|--version)
-            printf 'paseo-monitor %s\n' "$PM_VERSION"
-            ;;
-        help|--help|-h)
-            usage
-            ;;
-        watch)
-            shift
-            pm_watch_main "$@"
-            ;;
-        kinds)
-            pm_kinds
-            ;;
-        ls)
-            pm_ls
-            ;;
-        _sweep)
-            pm_sweep
-            ;;
-        status)
-            shift
-            pm_status "$@"
-            ;;
-        poke)
-            shift
-            pm_poke "$@"
-            ;;
-        log)
-            shift
-            pm_log "$@"
-            ;;
-        rm)
-            shift
-            pm_rm "$@"
-            ;;
-        reap)
-            shift
-            pm_reap "$@"
-            ;;
-        *)
-            printf 'paseo-monitor: unknown subcommand: %s\n' "$1" >&2
-            printf 'Try paseo-monitor --help.\n' >&2
-            exit 2
-            ;;
-    esac
-fi
-
+if __name__ == "__main__":
+    sys.exit(main())

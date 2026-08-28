@@ -66,7 +66,7 @@ source_monitor() {
     PM_SOURCE_ONLY=1
     export PM_SOURCE_ONLY
     # shellcheck disable=SC1090
-    . "$PMT_BIN"
+    . "$PMT_REPO_ROOT/bin/paseo-monitor.sh"
 }
 
 pmt_sweep_minimal_path() {

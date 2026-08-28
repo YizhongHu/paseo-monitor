@@ -1,4 +1,5 @@
 import contextlib
+import importlib.machinery
 import importlib.util
 import io
 import os
@@ -11,10 +12,11 @@ import unittest
 from pathlib import Path
 
 
-MODULE_PATH = Path(__file__).resolve().parents[1] / "bin" / "paseo-monitor.py"
-SPEC = importlib.util.spec_from_file_location("paseo_monitor", str(MODULE_PATH))
+MODULE_PATH = Path(__file__).resolve().parents[1] / "bin" / "paseo-monitor"
+LOADER = importlib.machinery.SourceFileLoader("paseo_monitor", str(MODULE_PATH))
+SPEC = importlib.util.spec_from_loader("paseo_monitor", LOADER)
 PM = importlib.util.module_from_spec(SPEC)
-SPEC.loader.exec_module(PM)
+LOADER.exec_module(PM)
 
 
 class FoundationTests(unittest.TestCase):

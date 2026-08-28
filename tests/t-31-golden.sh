@@ -12,7 +12,7 @@ PMT_REFERENCE_BIN="$PMT_REPO_ROOT/reference/paseo-monitor.sh"
 GOLDEN_DIR="$PMT_REPO_ROOT/tests/golden"
 PMT_PYTHON_DIR=""
 case "$PMT_BIN" in
-    *.py) PMT_PYTHON_DIR=$(dirname "$(command -v python3)") ;;
+    *.py|*/paseo-monitor) PMT_PYTHON_DIR=$(dirname "$(command -v python3)") ;;
 esac
 CANDIDATE_DIR="$SANDBOX/candidate"
 mkdir -p "$CANDIDATE_DIR"
@@ -35,7 +35,7 @@ normalize_text() {
         -e 's/\[[0-9][0-9]*\]/[<PID>]/g' \
         -e 's/^[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9][+-][0-9][0-9][0-9][0-9] /<TIMESTAMP> /g' \
         -e 's/nextDue=[0-9][0-9]*/nextDue=<EPOCH>/g' \
-        -e 's#^python=.*#python=<PYTHON>#' \
+        -e 's#^python=/.*#python=<PYTHON>#' \
         -e 's#^helper=.*#helper=<HELPER>#'
 }
 capture_report() {

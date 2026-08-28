@@ -19,6 +19,18 @@ case "$PM_FAST_SWEEP" in 0|1) ;; *) PM_FAST_SWEEP=0 ;; esac
 case "$PM_PROBE_TIMEOUT" in ''|*[!0-9]*) PM_PROBE_TIMEOUT=45 ;; esac
 PM_LAUNCHD_LABEL=com.paseo-monitor.sweep
 PM_INSTALLER="${PASEO_MONITOR_INSTALLER:-$(dirname "$0")/../install.sh}"
+PM_RUNTIME_DIR="$(CDPATH= cd -- "$(dirname "$0")" 2>/dev/null && pwd)"
+PM_PYTHON_RESOLVER="${PM_PYTHON_RESOLVER:-$PM_RUNTIME_DIR/resolve-python3}"
+if [ ! -x "$PM_PYTHON_RESOLVER" ]; then
+    PM_INSTALLER_DIR="$(CDPATH= cd -- "$(dirname "$PM_INSTALLER")" 2>/dev/null && pwd)"
+    if [ -x "$PM_INSTALLER_DIR/bin/resolve-python3" ]; then
+        PM_PYTHON_RESOLVER="$PM_INSTALLER_DIR/bin/resolve-python3"
+    fi
+fi
+PM_PYTHON="${PASEO_MONITOR_PYTHON:-}"
+if [ -z "$PM_PYTHON" ] && [ -x "$PM_PYTHON_RESOLVER" ]; then
+    PM_PYTHON="$("$PM_PYTHON_RESOLVER" 2>/dev/null || printf '')"
+fi
 PM_PY_AGENT_PROBE='import json,sys; d=json.load(sys.stdin); status=str(d.get("Status",d.get("status","UNKNOWN"))).upper(); archived=bool(d.get("Archived",d.get("archived",False))) or bool(d.get("ArchivedAt",d.get("archivedAt",""))); perms=d.get("PendingPermissions",d.get("pendingPermissions",[])); perms=perms if isinstance(perms,list) else []; updated=d.get("UpdatedAt",d.get("updatedAt","")); token="ARCHIVED" if archived else ("BLOCKED-PERMISSION" if perms else status); prefix="went idle " if token=="IDLE" else ""; idle=(" idle_since="+str(updated)) if token=="IDLE" else ""; print("%s %sstatus=%s archived=%s pendingPermissions=%d queue_depth=%d updated_at=%s%s" % (token,prefix,status,str(archived).lower(),len(perms),len(perms),str(updated),idle))'
 PM_PY_GLOBUS_PROBE="$(cat <<'PY'
 import json, sys
@@ -252,7 +264,7 @@ PY
 )"
 
 pm_match_agent() {
-    python3 -c "$PM_PY_MATCH_AGENT" "$1"
+    "$PM_PYTHON" -c "$PM_PY_MATCH_AGENT" "$1"
 }
 
 resolve_agent() {
@@ -292,7 +304,7 @@ inspect_agent() {
     # inspect_agent <uuid> -- print status archived pending-permission-count.
     ia_json="$(paseo inspect "$1" --json 2>/dev/null)" || return 1
     [ -n "$ia_json" ] || return 1
-    printf '%s' "$ia_json" | python3 -c "$PM_PY_INSPECT_AGENT"
+    printf '%s' "$ia_json" | "$PM_PYTHON" -c "$PM_PY_INSPECT_AGENT"
 }
 
 lock_holder_alive() {
@@ -654,6 +666,15 @@ pm_parse_probe_output() {
 pm_resolve_binary() {
     # pm_resolve_binary <name> -- resolve one executable to an absolute path.
     prb_name="$1"
+    if [ "$prb_name" = python3 ]; then
+        [ -n "$PM_PYTHON" ] || {
+            [ -x "$PM_PYTHON_RESOLVER" ] || return 1
+            PM_PYTHON="$("$PM_PYTHON_RESOLVER" 2>/dev/null || printf '')"
+        }
+        [ -n "$PM_PYTHON" ] || return 1
+        PM_RESOLVED_BINARY="$PM_PYTHON"
+        return 0
+    fi
     case "$prb_name" in
         /*)
             [ -x "$prb_name" ] || {
@@ -929,7 +950,7 @@ pm_harvest_labels() {
     phl_labels=""
     if [ -n "${PASEO_AGENT_ID:-}" ] && command -v paseo >/dev/null 2>&1; then
         phl_json="$(paseo inspect "$PASEO_AGENT_ID" --json 2>/dev/null || printf '')"
-        [ -n "$phl_json" ] && phl_labels="$(printf '%s' "$phl_json" | python3 -c "$PM_PY_HARVEST_LABELS" 2>/dev/null || printf '')"
+        [ -n "$phl_json" ] && phl_labels="$(printf '%s' "$phl_json" | "$PM_PYTHON" -c "$PM_PY_HARVEST_LABELS" 2>/dev/null || printf '')"
     fi
     [ -n "$phl_labels" ] || phl_labels="${PASEO_LABELS:-}"
     [ -n "${PASEO_LABEL_ROLE:-}" ] && phl_labels="${phl_labels}${phl_labels:+|}role=$PASEO_LABEL_ROLE"
@@ -958,11 +979,11 @@ pm_discover_provider() {
     pdp_paseo="$PM_RESOLVED_BINARY"
     if [ -n "${PASEO_AGENT_ID:-}" ]; then
         pdp_json="$("$pdp_paseo" inspect "$PASEO_AGENT_ID" --json 2>/dev/null || printf '')"
-        [ -n "$pdp_json" ] && pdp_provider="$(printf '%s' "$pdp_json" | python3 -c "$PM_PY_CALLER_PROVIDER" 2>/dev/null || printf '')"
+        [ -n "$pdp_json" ] && pdp_provider="$(printf '%s' "$pdp_json" | "$PM_PYTHON" -c "$PM_PY_CALLER_PROVIDER" 2>/dev/null || printf '')"
     fi
     if [ -z "$pdp_provider" ]; then
         pdp_json="$("$pdp_paseo" provider ls --json 2>/dev/null || printf '')"
-        [ -n "$pdp_json" ] && pdp_provider="$(printf '%s' "$pdp_json" | python3 -c "$PM_PY_DEFAULT_PROVIDER" 2>/dev/null || printf '')"
+        [ -n "$pdp_json" ] && pdp_provider="$(printf '%s' "$pdp_json" | "$PM_PYTHON" -c "$PM_PY_DEFAULT_PROVIDER" 2>/dev/null || printf '')"
     fi
     [ -n "$pdp_provider" ] || return 1
     printf '%s\n' "$pdp_provider"
@@ -1000,7 +1021,7 @@ pm_schedule_create() {
         rm -f "$psc_out" "$psc_err"
         return "$psc_rc"
     fi
-    psc_id="$(python3 -c "$PM_PY_SCHEDULE_ID" < "$psc_out" 2>/dev/null || printf '')"
+    psc_id="$("$PM_PYTHON" -c "$PM_PY_SCHEDULE_ID" < "$psc_out" 2>/dev/null || printf '')"
     case "$psc_id" in
         ''|*[!A-Za-z0-9._:-]*) psc_id="$(sed -n 's/.*\"id\"[[:space:]]*:[[:space:]]*\"\([^\"]*\)\".*/\1/p' "$psc_out" | sed -n '1p')" ;;
     esac
@@ -1672,12 +1693,14 @@ labels=$pwm_labels"
     pm_atomic_write "$pwm_dir/state" active || { rm -rf "$pwm_dir"; return 1; }
     pwm_out="$pwm_dir/.register.stdout"
     pwm_err="$pwm_dir/.register.stderr"
+    pwm_sandbox=0
     pm_run_registered_probe "$pwm_dir" "$pwm_out" "$pwm_err"
     pwm_rc=$?
-    pwm_sandbox=0
     if [ "$pwm_rc" -ne 0 ] || ! pm_parse_probe_output "$pwm_out"; then
         pwm_err_text="$(cat "$pwm_err" 2>/dev/null || printf '')"
         pwm_class="$(pm_health_failure_class "$pwm_rc" "$pwm_err_text")"
+        # Built-in probes may be retried by the unsandboxed sweeper; a script
+        # failure belongs to the watch specification and still aborts.
         if [ "$pwm_class" = sandbox ] && [ "$pwm_kind" != script ]; then
             [ -n "$pwm_err_text" ] && printf '%s\n' "$pwm_err_text" >&2
             printf 'paseo-monitor: WARN registration probe unavailable in caller sandbox; sweeper will make the first observation\n' >&2
@@ -1719,15 +1742,17 @@ labels=$pwm_labels"
     pwm_trigger="$(pm_trigger_state)"
     log_line "$pwm_dir" TRIGGER "$pwm_trigger" || :
     [ "$pwm_trigger" = stale ] && pm_self_heal_trigger || :
-    if pm_terminal_token "$PM_PARSED_TOKEN" "$pwm_terminal"; then
-        pm_report_event "$pwm_dir" terminal "(none)" "$PM_PARSED_TOKEN" "$PM_PARSED_DETAIL" || :
-        if [ ! -f "$pwm_dir/undelivered" ]; then
-            set_state "$pwm_dir" terminal || :
-            pm_clear_failsafe "$pwm_dir"
+    if [ "$pwm_sandbox" -eq 0 ]; then
+        if pm_terminal_token "$PM_PARSED_TOKEN" "$pwm_terminal"; then
+            pm_report_event "$pwm_dir" terminal "(none)" "$PM_PARSED_TOKEN" "$PM_PARSED_DETAIL" || :
+            if [ ! -f "$pwm_dir/undelivered" ]; then
+                set_state "$pwm_dir" terminal || :
+                pm_clear_failsafe "$pwm_dir"
+            fi
+        elif [ "$pwm_start_report" -eq 1 ]; then
+            pm_report_event "$pwm_dir" started "(none)" "$PM_PARSED_TOKEN" "$PM_PARSED_DETAIL" 1 0 || :
+            [ -f "$pwm_dir/undelivered" ] && set_state "$pwm_dir" active || :
         fi
-    elif [ "$pwm_start_report" -eq 1 ]; then
-        pm_report_event "$pwm_dir" started "(none)" "$PM_PARSED_TOKEN" "$PM_PARSED_DETAIL" 1 0 || :
-        [ -f "$pwm_dir/undelivered" ] && set_state "$pwm_dir" active || :
     fi
     rm -f "$pwm_out" "$pwm_err"
     pwm_attempts=$(( (pwm_deadline_epoch - pwm_now + pwm_interval - 1) / pwm_interval ))
