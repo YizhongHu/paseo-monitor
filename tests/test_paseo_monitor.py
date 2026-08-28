@@ -77,7 +77,7 @@ class FoundationTests(unittest.TestCase):
         PM.atomic_write_bytes(path, raw)
         parsed = PM.read_spec(path)
         self.assertEqual(parsed["custom"], "a=b")
-        PM.atomic_write_bytes(path, path.read_bytes())
+        PM.write_spec(path, parsed)
         self.assertEqual(path.read_bytes(), raw)
         canonical = PM.serialize_spec({"kind": "script", "script": "/tmp/probe"})
         self.assertEqual(canonical, b"kind=script\nscript=/tmp/probe\n")

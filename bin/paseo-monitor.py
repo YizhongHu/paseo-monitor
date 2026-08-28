@@ -183,24 +183,36 @@ def load_config(environ=None):
     return Config.from_env(environ)
 
 
+class Spec(dict):
+    """Mapping with the original bytes needed for lossless persistence."""
+
+    def __init__(self, *args, **kwargs):
+        self.raw = kwargs.pop("raw", None)
+        super().__init__(*args, **kwargs)
+        self._snapshot = dict(self)
+
+
 def read_spec(path):
     """Read shell spec key/value records, retaining values after the first =."""
-    result = {}
-    with open(str(path), "rb") as handle:
-        for raw in handle.read().splitlines():
-            line = raw.decode("utf-8", "replace")
-            if "=" in line:
-                key, value = line.split("=", 1)
-                if key not in result:
-                    result[key] = value
+    raw_bytes = Path(path).read_bytes()
+    result = Spec(raw=raw_bytes)
+    for raw in raw_bytes.splitlines():
+        line = raw.decode("utf-8", "replace")
+        if "=" in line:
+            key, value = line.split("=", 1)
+            if key not in result:
+                result[key] = value
+    result._snapshot = dict(result)
     return result
 
 
 def serialize_spec(values):
+    if isinstance(values, Spec) and values.raw is not None and dict(values) == values._snapshot:
+        return values.raw
     if isinstance(values, (bytes, bytearray)):
         return bytes(values)
-    items = []
     keys = list(SPEC_KEYS) + [key for key in values if key not in SPEC_KEYS]
+    items = []
     for key in keys:
         if key in values:
             items.append("%s=%s" % (key, values[key]))
