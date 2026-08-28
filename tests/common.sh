@@ -4,7 +4,7 @@ set -u
 
 PMT_SELF_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
 PMT_REPO_ROOT="$(CDPATH= cd -- "$PMT_SELF_DIR/.." && pwd)"
-PMT_BIN="$PMT_REPO_ROOT/bin/paseo-monitor"
+PMT_BIN="${PMT_BIN:-$PMT_REPO_ROOT/bin/paseo-monitor}"
 PMT_MOCK_DIR="$PMT_REPO_ROOT/tests/mock"
 SANDBOX=""
 MOCK_DIR=""

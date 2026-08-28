@@ -65,7 +65,7 @@ pm_install_python_wrapper() {
         *) echo "install.sh: resolver returned a non-absolute interpreter: $pm_python" >&2; exit 1 ;;
     esac
     pm_python_q="$(pm_shell_quote "$pm_python")"
-    pm_repo_bin_q="$(pm_shell_quote "$REPO_DIR/bin/paseo-monitor")"
+    pm_repo_bin_q="$(pm_shell_quote "$REPO_DIR/bin/paseo-monitor.py")"
     pm_wrapper_content="#!/bin/sh
 # paseo-monitor: installed launcher with a validated interpreter pin.
 PASEO_MONITOR_PYTHON=$pm_python_q
@@ -124,7 +124,7 @@ pm_install_agent() {
         echo "install.sh: FAILED - pinned paseo-monitor launcher or --help failed." >&2
         exit 1
     fi
-    echo "install.sh: SUCCESS - installed $PM_ENTRYPOINT -> $PM_WRAPPER -> $REPO_DIR/bin/paseo-monitor"
+    echo "install.sh: SUCCESS - installed $PM_ENTRYPOINT -> $PM_WRAPPER -> $REPO_DIR/bin/paseo-monitor.py"
     echo "install.sh: SUCCESS - launchd agent $PM_LABEL bootstrapped"
 }
 

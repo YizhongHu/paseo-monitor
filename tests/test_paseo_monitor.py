@@ -3,6 +3,8 @@ import importlib.util
 import io
 import os
 import stat
+import subprocess
+import sys
 import tempfile
 import time
 import unittest
@@ -711,3 +713,82 @@ class DeliveryLifecycleTests(unittest.TestCase):
         self.assertEqual((on_dir / "state").read_text().strip(), "delivery-expired")
         self.assertIn("undelivered_expired=yes", PM.pm_status(on_dir, self.config))
         self.assertIn("DELIVERY-EXPIRED", (on_dir / "log").read_text())
+
+
+class PublicCliFixTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.root = Path(self.temp.name) / "home"
+        self.bin = Path(self.temp.name) / "bin"
+        self.bin.mkdir()
+        self.probe = self.bin / "probe"
+        self.probe.write_text("#!/bin/sh\nprintf 'RUNNING detail\\n'\n")
+        self.probe.chmod(0o700)
+        self.config = PM.Config(
+            home=self.root, log_max_bytes=100000, lock_grace_seconds=0,
+            backoff_scale=0, fast_sweep=True, probe_timeout=1,
+        )
+
+    def tearDown(self):
+        self.temp.cleanup()
+
+    def test_graveyard_moves_and_cli_status_log_reap_resolve_removed_watch(self):
+        watch_id, _ = PM.register_watch({
+            "kind": "script", "script": str(self.probe), "reason": "graveyard",
+            "terminal": "DONE", "deadline": str(int(time.time()) + 300),
+        }, config=self.config)
+        live = self.root / "watches" / watch_id
+        before = (live / "log").read_text()
+        self.assertTrue(PM.remove_watch(live, self.config))
+        grave = self.root / "graveyard" / watch_id
+        self.assertTrue(grave.is_dir())
+        self.assertTrue((self.root / "watches" / watch_id).is_symlink())
+        self.assertTrue(os.path.samefile(str(live), str(grave)))
+        env = dict(os.environ, PASEO_MONITOR_HOME=str(self.root))
+        status = subprocess.run(
+            [sys.executable, str(MODULE_PATH), "status", watch_id],
+            env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            text=True, check=False,
+        )
+        self.assertEqual(status.returncode, 0)
+        self.assertIn("state=removed", status.stdout)
+        log = subprocess.run(
+            [sys.executable, str(MODULE_PATH), "log", watch_id, "-n", "20"],
+            env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            text=True, check=False,
+        )
+        self.assertEqual(log.returncode, 0)
+        self.assertIn("REGISTER", log.stdout)
+        PM.update_spec(grave / "spec", "deadline", "1")
+        self.assertEqual(PM._cli_reap(self.config), 0)
+        self.assertFalse(grave.exists())
+        self.assertFalse((self.root / "watches" / watch_id).exists())
+
+    def test_failsafe_fallback_prints_provider_or_placeholder(self):
+        paseo = self.bin / "paseo"
+        paseo.write_text("#!/bin/sh\nprintf 'schedule failed\\n' >&2\nexit 9\n")
+        paseo.chmod(0o700)
+        env = dict(os.environ)
+        env["PASEO_MONITOR_HOME"] = str(self.root)
+        env["PATH"] = str(self.bin) + os.pathsep + os.path.dirname(sys.executable)
+        result = subprocess.run(
+            [sys.executable, str(MODULE_PATH), "watch", "--script", str(self.probe),
+             "--reason", "failsafe", "--terminal", "DONE", "--failsafe",
+             "--provider", "provider-a", "--deadline", "+300"],
+            env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            text=True, check=False,
+        )
+        self.assertEqual(result.returncode, 0)
+        self.assertIn("--provider provider-a", result.stdout)
+
+    def test_p2_golden_fixtures_against_python_entrypoint(self):
+        env = dict(os.environ)
+        env["PMT_BIN"] = str(MODULE_PATH)
+        result = subprocess.run(
+            ["sh", str(MODULE_PATH.parents[1] / "tests" / "t-31-golden.sh")],
+            cwd=str(MODULE_PATH.parents[1]), env=env,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            text=True, check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("PASS: CLI, report envelope, specs, state layout", result.stdout)

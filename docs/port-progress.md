@@ -80,5 +80,36 @@ and not silently discarded.
 
 ## Next lane
 
-**P5:** add the public Python CLI, argument/error compatibility, and durable
-registration/list/status command surfaces over the P4/P4b APIs.
+**P6:** deliberate cutover using the pinned Python launcher and launchd
+installation path; do not run `install.sh` from this port workspace.
+
+## P5 public CLI and cutover handoff
+
+`bin/paseo-monitor.py` now owns the complete public command surface:
+`watch`, `kinds`, `ls`, `status`, `log`, `poke`, `rm`, `reap`, `_sweep`,
+`help`, and `version`. The P2 golden harness can run unchanged against the
+Python executable and reproduces every committed fixture: help, kinds, errors,
+all five report classes, bundled specs, durable state layout, and surface
+agreement.
+
+Removed watches are moved into `graveyard/<id>` and leave a
+`watches/<id>` compatibility symlink. `status` and `log` resolve either live
+or graveyard storage; `reap` removes expired graveyard entries and their links.
+`rm --all` requires `PASEO_AGENT_ID` and is caller-scoped. `--all-agents`
+prints owner/report attribution before unattended global removal.
+
+Status includes sweep freshness, ownership, last token/transition, delivery
+attempt/error, undelivered state, fires, deadline, log and sweeper-log paths.
+Parked watches explicitly report that they will not probe until poked.
+Sweeps atomically write `sweep.beacon`.
+
+`install.sh` still uses the pinned interpreter from `bin/resolve-python3`, but
+the generated launcher now executes `bin/paseo-monitor.py`; the existing
+marker-protected launchd plist remains the trigger (`StartInterval=60`,
+`RunAtLoad`, explicit `PATH`) and skills are copied to all three supported
+skill roots.
+
+Deliberate compatibility boundary: direct Python library tests retain P4b's
+`observed_at`/`handoff_at` report envelope, while CLI invocations use the P2
+shell-compatible `at=` envelope and numeric event IDs. This keeps the frozen
+CLI golden bytes intact without regressing the P4b API contract.

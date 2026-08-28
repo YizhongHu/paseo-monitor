@@ -10,6 +10,10 @@ export PASEO_MONITOR_LOG_MAX_BYTES
 
 PMT_REFERENCE_BIN="$PMT_REPO_ROOT/reference/paseo-monitor.sh"
 GOLDEN_DIR="$PMT_REPO_ROOT/tests/golden"
+PMT_PYTHON_DIR=""
+case "$PMT_BIN" in
+    *.py) PMT_PYTHON_DIR=$(dirname "$(command -v python3)") ;;
+esac
 CANDIDATE_DIR="$SANDBOX/candidate"
 mkdir -p "$CANDIDATE_DIR"
 
@@ -17,6 +21,8 @@ normalize_text() {
     sed \
         -e "s|$SANDBOX|<SANDBOX>|g" \
         -e "s|$PM_HOME|<HOME>|g" \
+        -e "s|$PASEO_MONITOR_HOME|<HOME>|g" \
+        -e 's|/[^ ]*/home/\.paseo-monitor/watches/|<SANDBOX>/home/.paseo-monitor/watches/|g' \
         -e 's/at=[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9][+-][0-9][0-9][0-9][0-9]/at=<TIMESTAMP>/g' \
         -e 's/registered=[0-9][0-9]*/registered=<EPOCH>/g' \
         -e 's/deadline=[0-9][0-9]*/deadline=<EPOCH>/g' \
@@ -100,7 +106,7 @@ record_error script-terminal-mandatory watch --script "$SANDBOX/probe" --reason 
 record_error slurm-cadence-floor watch --kind slurm --host cannon --job 42 --interval 119 --deadline +300
 record_error registration-probe-failure watch --script "$SANDBOX/broken" --reason broken --terminal DONE --deadline +300
 old_path="$PATH"
-PATH="$SANDBOX/empty:/usr/bin:/bin:/usr/sbin:/sbin"
+PATH="$SANDBOX/empty:${PMT_PYTHON_DIR:+$PMT_PYTHON_DIR:}/usr/bin:/bin:/usr/sbin:/sbin"
 export PATH
 record_error required-paseo-helper watch --kind agent --agent AGENT-ID --deadline +300
 PATH="$old_path"
