@@ -5,10 +5,9 @@ A launchd-fired sweeper observes a due watch and reports state changes and
 lifecycle events; the caller owns the liveness backstop. The complete design
 is in `PLAN.md`.
 
-This checkout is the Python port site. The target runtime is Python
-3.8-compatible standard library only, with no third-party imports. At
-`bd32317`, the executable is still the shell reference while phases P3–P6
-replace it; do not read the target runtime contract as already shipped.
+The production entrypoint is the Python 3.8-compatible standard-library
+executable `bin/paseo-monitor`. The previous POSIX shell implementation is
+retained at `bin/paseo-monitor.sh` as the one-release rollback path.
 Launchd remains the deliberate trigger: its GUI agent preserves
 `SSH_AUTH_SOCK` and login-Keychain access for cluster probes. The installer
 and interpreter resolver remain POSIX `sh` transition tooling.
