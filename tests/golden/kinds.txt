@@ -1,0 +1,8 @@
+slurm | Slurm job state | --host <host> --job <id> [--report-transitions] [--report-on <tokens>] [--with-reason] --deadline <when> | floor=120 | default=600 terminal-only, 300 transitions
+pbs | PBS job state | --host <host> --job <id> [--report-transitions] [--report-on <tokens>] --deadline <when> | floor=120 | default=600 terminal-only, 300 transitions
+globus | Globus transfer status | --task <id> --deadline <when> | floor=60 | default=300
+agent | Paseo agent status | --agent <id> [--report-on <tokens>] [--dwell <sweeps>] --deadline <when> | floor=60 | default=60, dwell=2
+file-exists | Absence / receipt pattern; job-id-keyed watches cannot observe a target that never entered the queue | --path <receipt-path> [--host <host>] --deadline <when> | floor=60 local, 120 remote | default=60 local, 120 remote | example: paseo-monitor watch --kind file-exists --path /scratch/run/receipt --deadline +3600
+git-ref | Git ref SHA | --remote <remote> --ref <ref> --deadline <when> | floor=60 | default=120
+pr-merge | Pull request merge state | --repo <owner/repo> --pr <number> --deadline <when> | floor=60 | default=300
+script | Custom executable | --script <file> --reason "<why no kind fits>" --deadline <when> | floor=60 | default=60

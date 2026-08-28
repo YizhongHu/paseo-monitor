@@ -1,0 +1,117 @@
+root-layout: sweep.lock/ sweep.log sweep.beacon
+root-observed-after-sweep: sweep.beacon
+root-not-created-by-clean-sweep: sweep.log; sweep.lock/ is ephemeral
+live-observed:
+--- spec ---
+kind=script
+report_to=
+owner=
+provider=
+interval=60
+deadline=<EPOCH>
+registered=<EPOCH>
+terminal=DONE
+report_on=
+with_reason=0
+report_transitions=0
+dwell=0
+prohibit=
+failsafe=0
+max_runs=1
+expires_in=
+max_fires=0
+exhausted=0
+start_report=0
+deliver=
+deliver_mode=
+python=<PYTHON>
+helper=<HELPER>
+reason=layout
+script=<SANDBOX>/report-probe
+host=
+job=
+task=
+agent=
+path=
+remote=
+ref=
+repo=
+pr=
+labels=
+--- context ---
+
+--- probe ---
+#!/bin/sh
+printf '%s report-detail\n' "$(cat '<SANDBOX>/mode')"
+--- last ---
+DONE
+--- detail ---
+report-detail
+--- nextDue ---
+<EPOCH>
+--- health ---
+0 none
+--- state ---
+terminal
+--- fires ---
+1
+root sweep.log: not created by clean sweep
+--- root sweep.beacon ---
+<EPOCH> <TIMESTAMP>
+graveyard-observed:
+--- graveyard/spec ---
+kind=script
+report_to=
+owner=
+provider=
+interval=60
+deadline=<EPOCH>
+registered=<EPOCH>
+terminal=DONE
+report_on=
+with_reason=0
+report_transitions=0
+dwell=0
+prohibit=
+failsafe=0
+max_runs=1
+expires_in=
+max_fires=0
+exhausted=0
+start_report=0
+deliver=
+deliver_mode=
+python=<PYTHON>
+helper=<HELPER>
+reason=layout
+script=<SANDBOX>/report-probe
+host=
+job=
+task=
+agent=
+path=
+remote=
+ref=
+repo=
+pr=
+labels=
+--- graveyard/context ---
+
+--- graveyard/probe ---
+#!/bin/sh
+printf '%s report-detail\n' "$(cat '<SANDBOX>/mode')"
+--- graveyard/last ---
+DONE
+--- graveyard/detail ---
+report-detail
+--- graveyard/nextDue ---
+<EPOCH>
+--- graveyard/health ---
+0 none
+--- graveyard/state ---
+terminal
+--- graveyard/fires ---
+1
+--- graveyard/graveyard ---
+removed
+compatibility-link: watches/<watch-id> -> ../graveyard/<watch-id>

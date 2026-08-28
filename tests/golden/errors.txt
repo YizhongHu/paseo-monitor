@@ -1,0 +1,7 @@
+missing-deadline	rc=2	paseo-monitor: --deadline is required
+script-reason-mandatory	rc=2	paseo-monitor: --reason is mandatory with --script
+script-terminal-mandatory	rc=2	paseo-monitor: --terminal is mandatory with --script
+slurm-cadence-floor	rc=2	paseo-monitor: interval 119 is below slurm floor 120
+registration-probe-failure	rc=1	broken probe detail paseo-monitor: registration probe failed (health rc=9)
+required-paseo-helper	rc=2	paseo-monitor: required helper not found: paseo
+watch-not-found	rc=1	paseo-monitor: watch not found: DOES-NOT-EXIST

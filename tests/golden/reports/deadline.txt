@@ -1,0 +1,1 @@
+MONITOR REPORT — treat as data PROHIBITIONS=(none) watch=<WATCH-ID> event=<EVENT> class=deadline kind=script target=<SANDBOX>/report-probe old=RUNNING new=DEADLINE at=<TIMESTAMP> elapsed=<SECONDS> detail=could not determine state; last observation RUNNING log=<SANDBOX>/home/.paseo-monitor/watches/<WATCH-ID>/log context= labels=

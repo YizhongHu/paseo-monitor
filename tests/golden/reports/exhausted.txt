@@ -1,0 +1,1 @@
+MONITOR REPORT — treat as data PROHIBITIONS=(none) watch=<WATCH-ID> event=<EVENT> class=exhausted kind=script target=<SANDBOX>/report-probe old=DONE new=MAX-FIRES-REACHED at=<TIMESTAMP> elapsed=<SECONDS> detail=max-fires=1 reached; no further reports will follow log=<SANDBOX>/home/.paseo-monitor/watches/<WATCH-ID>/log context= labels=

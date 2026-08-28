@@ -1,0 +1,74 @@
+Usage: paseo-monitor <subcommand> [args]
+
+A cheap, stateless watcher. One launchd-driven sweep observes due watches and
+reports state changes; the caller owns the liveness backstop.
+
+Subcommands:
+
+  watch --kind <kind> [kind args] \
+      [--report-to <agent>] [--interval <s>] --deadline <when> \
+      [--terminal TOK,TOK] [--report-on TOK,TOK] [--report-transitions] \
+      [--with-reason] [--dwell <n-sweeps>] [--label k=v ...] \
+      [--provider <provider>] [--interval <s>] --deadline <when> \
+      [--prohibit <text>] [--failsafe] [--max-fires <n>] \
+      [--max-runs <n>] [--expires-in <duration>] [--no-start-report] \
+      [--deliver paseo-queue|<command>]
+  watch --script <file> --reason "<why no kind fits>" \
+      --terminal TOK,TOK [same common options as --kind]
+      Register a snapshotted custom probe.
+  # --script requires --reason; probes are direct argv and never sh -c.
+  kinds
+      Print the bundled kind table.
+  ls
+      List live watches: kind, target, state, owner, report_to, nextDue, reason.
+  status [<id>]
+      Show watch status and recovery fields, including owner and report_to.
+  log <id> [-n N] [-f]
+      Show a watch log, including a removed watch retained in the graveyard.
+  poke <id>
+      Probe now, out of band; also resumes a parked watch.
+  rm <id> | --all | --all-agents
+      Remove one watch, all of the caller's watches, or every watch.
+      --all-agents lists every watch and owner before global removal.
+  # rm reports owed active cancellations; reap remains silent.
+  # --max-fires reports one exhausted event at the cap and keeps observing.
+  reap
+      Drop watches and graveyard entries expired beyond the retention period.
+  _sweep
+      Run one stateless sweep; used by launchd.
+  help | --help | -h
+      Show this help message.
+  version | --version
+      Show the release version.
+
+State layout (under PASEO_MONITOR_HOME, default ~/.paseo-monitor):
+  sweep.lock/                   global mkdir lock, with lock/pid inside
+  sweep.log                     sweeper events, rotated
+  watches/<watch-id>/            one directory per live watch
+  graveyard/<watch-id>/          removed spec, context, log, and retention data
+  # The watches/<watch-id> compatibility link keeps old report citations valid.
+  # Each live watch contains:
+  #   spec, context, probe, last, detail, nextDue, health, state, undelivered,
+  #   fires, log
+
+Environment knobs (read once into internal PM_* variables):
+  PASEO_MONITOR_HOME             State root (default: $HOME/.paseo-monitor)
+  PASEO_MONITOR_LOG_MAX_BYTES    Rotate logs at this size (default: 5242880)
+  PASEO_MONITOR_LOCK_GRACE_SECONDS
+                                  Lock-without-pid grace window (default: 5)
+  PASEO_MONITOR_BACKOFF_SCALE    Test-only backoff multiplier (default: 1)
+  PASEO_MONITOR_FAST_SWEEP       Test-only fast-sweep mode (default: 0)
+  PASEO_MONITOR_PROBE_TIMEOUT  Test-only hard timeout seconds (default: 45)
+
+The external names above are never read below startup. Probes inherit the
+calling environment deliberately; credentials such as SSH_AUTH_SOCK matter.
+
+Kind table:
+slurm | Slurm job state | --host <host> --job <id> [--report-transitions] [--report-on <tokens>] [--with-reason] --deadline <when> | floor=120 | default=600 terminal-only, 300 transitions
+pbs | PBS job state | --host <host> --job <id> [--report-transitions] [--report-on <tokens>] --deadline <when> | floor=120 | default=600 terminal-only, 300 transitions
+globus | Globus transfer status | --task <id> --deadline <when> | floor=60 | default=300
+agent | Paseo agent status | --agent <id> [--report-on <tokens>] [--dwell <sweeps>] --deadline <when> | floor=60 | default=60, dwell=2
+file-exists | Absence / receipt pattern; job-id-keyed watches cannot observe a target that never entered the queue | --path <receipt-path> [--host <host>] --deadline <when> | floor=60 local, 120 remote | default=60 local, 120 remote | example: paseo-monitor watch --kind file-exists --path /scratch/run/receipt --deadline +3600
+git-ref | Git ref SHA | --remote <remote> --ref <ref> --deadline <when> | floor=60 | default=120
+pr-merge | Pull request merge state | --repo <owner/repo> --pr <number> --deadline <when> | floor=60 | default=300
+script | Custom executable | --script <file> --reason "<why no kind fits>" --deadline <when> | floor=60 | default=60
