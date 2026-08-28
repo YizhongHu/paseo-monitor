@@ -10,6 +10,11 @@ mechanical. Register one watch, record the resume context, then return to the
 main task. The tool observes and records state changes; delivery is best-effort
 and the caller owns liveness.
 
+This checkout is the Python port site. The target runtime is Python
+3.8-compatible standard library only, with no third-party imports. At
+`bd32317`, the executable is still the shell reference while phases P3–P6
+replace it; the target runtime is pending, not a shipped behavior claim.
+
 Prefer this observe-half beside `paseo-queue`, which handles ordered delivery.
 Prefer it over `monitor-with-subagent` when a dumb probe suffices. For cluster
 work, read `cluster-access`: cadence is bounded by facility policy.

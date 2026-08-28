@@ -15,10 +15,12 @@ agent or from an inferred narrative.
 ## Ancestry and disposability
 
 The copied shell primitives originate in paseo-queue commit **7accacd** dated
-**2026-08-25** (`7accacdde5bf8eb07f4d6fd18542bf1fb0500975`). The repositories are
-siblings by design: copy, do not import or source a runtime library. If a bug
-is found in either repository's copied primitive, check the other repository
-for the same bug and fix both deliberately.
+**2026-08-25** (`7accacdde5bf8eb07f4d6fd18542bf1fb0500975`). This is historical
+ancestry only. `paseo-monitor` is being ported to Python while `paseo-queue`
+remains shell, so the cross-repo "fix both" rule is suspended for
+language-specific and runtime changes. `paseo-queue` has its own filed Python
+port item; when both tools are Python, deliberately check genuinely shared
+primitives in both repositories again.
 
 This is a disposable stopgap, with the same posture as paseo-queue. The eventual
 home is the Paseo daemon, which owns long-lived agent lifecycle and terminals.
@@ -29,24 +31,32 @@ continues until its daemon replacement exists.
 
 ## Implementation constraints
 
-- POSIX `sh` only. `/bin/sh` is bash 3.2.57 in `sh` mode. No arrays, `[[ ]]`,
-  `local`, or process substitution.
-- No `jq`, `flock`, `setsid`, `date +%s%N`, or `timeout(1)`.
-- Use Python 3.8 only for JSON one-liners, through `python3 -c "$VAR"`.
-  Never attach a heredoc to the `python3` invocation: it steals the JSON input
-  stream. Do not put substantial logic in Python.
-- Operational log timestamps use `America/New_York`.
-- Launchd is the required macOS trigger because its GUI agent preserves the
-  credential environment needed by SSH probes. Do not pre-build a scheduler
-  abstraction layer.
+- Python runtime target: Python 3.8-compatible standard library only. No
+  third-party imports.
+- Installation resolves and pins the interpreter. It runs each candidate and
+  requires the expected stdout marker and version; exit status is never
+  evidence. `/usr/bin/python3` on the target machine prints an `xcrun` error
+  and exits 0.
+- `xcode-select` currently points at a gutted
+  `/Library/Developer/CommandLineTools` whose `usr/bin` has 6 entries and no
+  `xcrun`; `sudo xcode-select -s
+  /Applications/Xcode.app/Contents/Developer` yields Python 3.9.6.
+- Python 3.8 has no `zoneinfo`; operational log timestamps use
+  `America/New_York` through `TZ` and `time.tzset()`.
+- Interpreter and external helper paths follow the existing resolve-and-
+  snapshot pattern (`helper=`, `paseo_bin=`), avoiding the `rc=127` class.
+- `launchd` remains the required macOS trigger because its GUI agent preserves
+  the credential environment needed by SSH probes.
 - The probe contract is direct argv execution, stdin `/dev/null`, bounded
   stdout/stderr, and a hard timeout. Never execute a probe through `sh -c`.
 - Do not sanitize the inherited environment: SSH and Kerberos credential
   variables are required by cluster probes.
+- Transition tooling remains POSIX `sh` (installer, resolver, and generated
+  launcher); run `sh -n` on every script and `tests/run-tests.sh` before
+  committing.
 - Tests use per-test `mktemp` sandboxes, isolated `PASEO_MONITOR_HOME`, mock
   shims first on `PATH`, and fast knobs. They must not touch a real daemon,
   cluster, or `~/.paseo-monitor`.
-- Run `sh -n` on every script and `tests/run-tests.sh` before committing.
 - Never put backticks in commit messages.
 
 ## State contract

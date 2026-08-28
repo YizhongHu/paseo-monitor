@@ -1,8 +1,6 @@
 # paseo-monitor — design plan
 
-Status: **implemented through `c75c3d8`**; this plan records the shipped
-contract and remaining design residue. See "Open questions" for the minor
-residue.
+Status: **Python port in progress; interpreter-resolution groundwork landed in `bd32317`**. This plan records the decided contract and remaining design work. See "Open questions" for the minor residue.
 
 Evidence base:
 
@@ -1402,21 +1400,18 @@ where to touch:
 | `stat -f %z` / `stat -c %s` | BSD vs GNU | already a fallback chain, inherited from `paseo-queue` |
 | `ps -p <pid> -o command=` | BSD vs GNU `ps` | lock-liveness check; minor |
 
-**Everything else is more portable than it needs to be** — and macOS is the
-reason. Targeting bash 3.2 in `sh` mode, with no `flock`, no `setsid`, no
-`timeout(1)`, and no `date +%s%N`, forces the core onto the lowest common
-denominator of POSIX shell. On Linux every one of those tools *is* available,
-so the constraints that make macOS annoying make the core **more** portable,
-not less. The paradox is worth stating: the platform we are coupled to is the
-one that disciplined the rest of the code into portability.
+**Historical shell-era note:** the original implementation targeted bash 3.2 in
+`sh` mode and avoided `flock`, `setsid`, `timeout(1)`, and nanosecond `date`
+formatting. That portability claim is retired for the Python port; the target
+runtime contract below is explicit.
 
-### What a port would take
+### What a platform port would take
 
-Replace the trigger. Nothing else. The scheduler is already isolated behind
-install and uninstall, and the swap is scheduler-agnostic by construction —
-probe contract, park policy, retention, delivery, deadline, and failsafe are
-all untouched by it. The `status` freshness beacon that detects trigger death
-is likewise scheduler-agnostic and needs no change.
+For a second platform, replace the trigger. The Python runtime contract below
+is independent of that scheduler seam; probe contract, park policy, retention,
+delivery, deadline, and failsafe remain unchanged by scheduler choice. The
+`status` freshness beacon that detects trigger death is likewise
+scheduler-agnostic and needs no change.
 
 **Do not pre-build a trigger abstraction layer.** There is exactly one
 platform today. Isolating install/uninstall is sufficient; a pluggable
@@ -1430,17 +1425,49 @@ assumption without having to find this plan.
 
 ## Implementation constraints
 
-Inherited from `paseo-queue/AGENTS.md`, same target environment:
+The POSIX `sh` constraint is retired for the Python port. It was inherited from
+`paseo-queue/AGENTS.md`, which targeted the same environment; it was not
+derived from a paseo-monitor requirement. It was already violated: the shell
+implementation carries 8 embedded Python programs as `PM_PY_*` string
+variables, so the tool already had a hard `python3` dependency, expressed
+badly. The shell layer directly caused real defects: a `dd bs=4096 count=1`
+short read silently discarded probe output; the test mock's non-atomic
+read + `sed 1d` + `mv` lost updates and made the suite ~50% flaky under load;
+macOS ships no `timeout(1)`, forcing a hand-rolled `pm_run_with_timeout`; and
+`pwm_`/`prp_`/`psw_` prefixes spread through the code because `sh` has no
+`local`.
 
-- POSIX `sh` only; `/bin/sh` is bash 3.2.57 in `sh` mode (verified). No
-  arrays, `[[ ]]`, `local`, process substitution.
-- No `jq`, no `flock`, no `setsid`, no `date +%s%N`, no `timeout(1)`.
-- `python3` (3.8) for JSON one-liners only, via `python3 -c "$VAR"` — never a
-  heredoc attached to `python3`, which redirects the interpreter's own stdin.
-- `launchd` is required — **not** for sleep handling (that argument was
-  conceded; the differential is ≤60 s) but for the **credential environment**:
-  a gui launchd agent carries `SSH_AUTH_SOCK` and login-Keychain access
-  natively, which the #1 kind's `ssh` probes depend on.
+### Settled Python runtime contract
+
+P3–P6 implement this contract; at `bd32317`, the port still has the shell
+runtime:
+
+- Python 3.8-compatible standard library only. No third-party imports.
+- The interpreter is resolved and pinned at install time. Installation runs
+  each candidate and requires the expected stdout marker and version; it never
+  authorizes a candidate from exit status. On this machine `/usr/bin/python3`
+  prints an `xcrun` error and exits 0, so an exit-status check accepts a broken
+  interpreter.
+- The root cause is `xcode-select` pointing at a gutted
+  `/Library/Developer/CommandLineTools`: its `usr/bin` has 6 entries and no
+  `xcrun`. The remedy is `sudo xcode-select -s
+  /Applications/Xcode.app/Contents/Developer`, which yields Python 3.9.6.
+- Python 3.8 has no `zoneinfo`; operational `America/New_York` logging uses
+  `TZ` plus `time.tzset()`.
+- This follows the existing resolve-and-snapshot pattern for `helper=` and
+  `paseo_bin=`. Without it, the port would reproduce the `rc=127` class with
+  the whole tool as the blast radius.
+- `launchd` remains the required macOS trigger for its GUI-agent credential
+  environment: `SSH_AUTH_SOCK` and login-Keychain access needed by cluster
+  probes.
+- Probes execute as direct argv with stdin `/dev/null`, bounded stdout/stderr,
+  and a hard timeout; never execute a probe through `sh -c`.
+- Do not sanitize the inherited environment: SSH and Kerberos credential
+  variables are required by cluster probes.
+
+Transition tooling remains shell: the installer and Python resolver are
+POSIX `sh` scripts. Run `sh -n` on those scripts and `tests/run-tests.sh`
+before committing.
 
 **One doctrine belongs in the tool's own `AGENTS.md`, not only in this plan:**
 **artifacts over narratives — deterministic probes cannot confabulate.** That

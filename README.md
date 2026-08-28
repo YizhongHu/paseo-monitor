@@ -5,11 +5,13 @@ A launchd-fired sweeper observes a due watch and reports state changes and
 lifecycle events; the caller owns the liveness backstop. The complete design
 is in `PLAN.md`.
 
-This repository targets macOS and POSIX `sh` (`/bin/sh` is bash 3.2.57 in
-`sh` mode). The deliberate trigger choice is launchd: its GUI agent preserves
-`SSH_AUTH_SOCK` and login-Keychain access for cluster probes. The core avoids
-platform-specific shell features and does not use `jq`, `flock`, `setsid`,
-`timeout(1)`, or nanosecond `date` formatting.
+This checkout is the Python port site. The target runtime is Python
+3.8-compatible standard library only, with no third-party imports. At
+`bd32317`, the executable is still the shell reference while phases P3–P6
+replace it; do not read the target runtime contract as already shipped.
+Launchd remains the deliberate trigger: its GUI agent preserves
+`SSH_AUTH_SOCK` and login-Keychain access for cluster probes. The installer
+and interpreter resolver remain POSIX `sh` transition tooling.
 
 ## CLI
 
@@ -205,7 +207,7 @@ bare cron process. Re-running the installer safely reloads the marked plist;
 watch state.
 
 `paseo-monitor version` and `paseo-monitor --version` print
-`paseo-monitor v1.2.0`.
+`paseo-monitor v1.3.0`.
 
 ## Development
 
