@@ -83,6 +83,14 @@ if [ "${P2_REBLESS:-0}" = 1 ]; then
     source_bin="$PMT_REFERENCE_BIN"
     bless=1
 fi
+golden_state_layout="$GOLDEN_DIR/state-layout.txt"
+golden_contract=python
+case "$source_bin" in
+    *.sh)
+        golden_state_layout="$PMT_REPO_ROOT/tests/golden-shell/state-layout.txt"
+        golden_contract=shell
+        ;;
+esac
 
 # CLI output is deterministic and retained byte-for-byte.
 "$source_bin" --help > "$CANDIDATE_DIR/help.txt" || fail "help command failed"
@@ -219,8 +227,13 @@ register_spec agent --kind agent --agent AGENT-ID
 # Capture the complete observed live/graveyard layout, including contents of
 # every durable file that registration and one sweep actually create.
 printf 'root-layout: sweep.lock/ sweep.log sweep.beacon\n' > "$CANDIDATE_DIR/state-layout.txt"
-printf 'root-observed-after-sweep: sweep.log sweep.beacon\n' >> "$CANDIDATE_DIR/state-layout.txt"
-printf 'root-created-by-clean-sweep: sweep.log; sweep.lock/ is ephemeral\n' >> "$CANDIDATE_DIR/state-layout.txt"
+if [ "$golden_contract" = shell ]; then
+    printf 'root-observed-after-sweep: sweep.beacon\n' >> "$CANDIDATE_DIR/state-layout.txt"
+    printf 'root-not-created-by-clean-sweep: sweep.log; sweep.lock/ is ephemeral\n' >> "$CANDIDATE_DIR/state-layout.txt"
+else
+    printf 'root-observed-after-sweep: sweep.log sweep.beacon\n' >> "$CANDIDATE_DIR/state-layout.txt"
+    printf 'root-created-by-clean-sweep: sweep.log; sweep.lock/ is ephemeral\n' >> "$CANDIDATE_DIR/state-layout.txt"
+fi
 layout_output=$("$source_bin" watch --script "$SANDBOX/report-probe" --reason layout --terminal DONE --no-start-report --deadline +300) || fail "layout registration failed"
 layout_id=$(printf '%s\n' "$layout_output" | sed -n 's/^watch \([^ ]*\) registered.*/\1/p')
 layout_dir="$PM_HOME/watches/$layout_id"
@@ -298,12 +311,12 @@ else
 fi
 
 if [ "$bless" -eq 1 ]; then
-    mkdir -p "$GOLDEN_DIR/reports"
+    mkdir -p "$GOLDEN_DIR/reports" "$(dirname "$golden_state_layout")"
     cp "$CANDIDATE_DIR/help.txt" "$GOLDEN_DIR/help.txt"
     cp "$CANDIDATE_DIR/kinds.txt" "$GOLDEN_DIR/kinds.txt"
     cp "$CANDIDATE_DIR/errors.txt" "$GOLDEN_DIR/errors.txt"
     cp "$CANDIDATE_DIR/specs.txt" "$GOLDEN_DIR/specs.txt"
-    cp "$CANDIDATE_DIR/state-layout.txt" "$GOLDEN_DIR/state-layout.txt"
+    cp "$CANDIDATE_DIR/state-layout.txt" "$golden_state_layout"
     cp "$CANDIDATE_DIR/surface-agreement.txt" "$GOLDEN_DIR/surface-agreement.txt"
     for report_class in started terminal deadline cancelled exhausted; do
         cp "$CANDIDATE_DIR/report-$report_class.txt" "$GOLDEN_DIR/reports/$report_class.txt"
@@ -313,8 +326,10 @@ if [ "$bless" -eq 1 ]; then
 fi
 
 for golden_file in help.txt kinds.txt errors.txt specs.txt state-layout.txt surface-agreement.txt; do
-    cmp -s "$CANDIDATE_DIR/$golden_file" "$GOLDEN_DIR/$golden_file" || {
-        diff -u "$GOLDEN_DIR/$golden_file" "$CANDIDATE_DIR/$golden_file" >&2
+    golden_path="$GOLDEN_DIR/$golden_file"
+    [ "$golden_file" = state-layout.txt ] && golden_path="$golden_state_layout"
+    cmp -s "$CANDIDATE_DIR/$golden_file" "$golden_path" || {
+        diff -u "$golden_path" "$CANDIDATE_DIR/$golden_file" >&2
         fail "golden drift: $golden_file"
     }
 done
