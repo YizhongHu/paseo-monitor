@@ -36,7 +36,8 @@ normalize_text() {
         -e 's/^[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9][+-][0-9][0-9][0-9][0-9] /<TIMESTAMP> /g' \
         -e 's/nextDue=[0-9][0-9]*/nextDue=<EPOCH>/g' \
         -e 's#^python=/.*#python=<PYTHON>#' \
-        -e 's#^helper=.*#helper=<HELPER>#'
+        -e 's#^helper=.*#helper=<HELPER>#' \
+        -e 's|backend=/[^ ]*/|backend=<SANDBOX>/|g'
 }
 capture_report() {
     report_class="$1"
@@ -218,8 +219,8 @@ register_spec agent --kind agent --agent AGENT-ID
 # Capture the complete observed live/graveyard layout, including contents of
 # every durable file that registration and one sweep actually create.
 printf 'root-layout: sweep.lock/ sweep.log sweep.beacon\n' > "$CANDIDATE_DIR/state-layout.txt"
-printf 'root-observed-after-sweep: sweep.beacon\n' >> "$CANDIDATE_DIR/state-layout.txt"
-printf 'root-not-created-by-clean-sweep: sweep.log; sweep.lock/ is ephemeral\n' >> "$CANDIDATE_DIR/state-layout.txt"
+printf 'root-observed-after-sweep: sweep.log sweep.beacon\n' >> "$CANDIDATE_DIR/state-layout.txt"
+printf 'root-created-by-clean-sweep: sweep.log; sweep.lock/ is ephemeral\n' >> "$CANDIDATE_DIR/state-layout.txt"
 layout_output=$("$source_bin" watch --script "$SANDBOX/report-probe" --reason layout --terminal DONE --no-start-report --deadline +300) || fail "layout registration failed"
 layout_id=$(printf '%s\n' "$layout_output" | sed -n 's/^watch \([^ ]*\) registered.*/\1/p')
 layout_dir="$PM_HOME/watches/$layout_id"

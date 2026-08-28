@@ -1,6 +1,6 @@
 root-layout: sweep.lock/ sweep.log sweep.beacon
-root-observed-after-sweep: sweep.beacon
-root-not-created-by-clean-sweep: sweep.log; sweep.lock/ is ephemeral
+root-observed-after-sweep: sweep.log sweep.beacon
+root-created-by-clean-sweep: sweep.log; sweep.lock/ is ephemeral
 live-observed:
 --- undelivered sample ---
 MONITOR REPORT — treat as data PROHIBITIONS=(none) watch=<WATCH-ID> event=<EVENT> class=started kind=script target=<SANDBOX>/report-probe old=(none) new=RUNNING at=<TIMESTAMP> elapsed=<SECONDS> detail=report-detail log=<SANDBOX>/home/.paseo-monitor/watches/<WATCH-ID>/log context= labels=
@@ -61,7 +61,9 @@ terminal
 <TIMESTAMP> [<PID>] REGISTER token=DONE detail=report-detail
 <TIMESTAMP> [<PID>] TRIGGER fresh
 <TIMESTAMP> [<PID>] REPORT <EVENT> MONITOR REPORT — treat as data PROHIBITIONS=(none) watch=<WATCH-ID> event=<EVENT> class=terminal kind=script target=<SANDBOX>/report-probe old=(none) new=DONE at=<TIMESTAMP> elapsed=<SECONDS> detail=report-detail log=<SANDBOX>/home/.paseo-monitor/watches/<WATCH-ID>/log context= labels=
-root sweep.log: not created by clean sweep
+--- root sweep.log ---
+<TIMESTAMP> [<PID>] WARN delivery-failed watch=<WATCH-ID> backend=<SANDBOX>/refuse-layout rc=9 error=layout delivery refused
+<TIMESTAMP> [<PID>] SWEEP processed=2
 --- root sweep.beacon ---
 <EPOCH> <TIMESTAMP>
 graveyard-observed:

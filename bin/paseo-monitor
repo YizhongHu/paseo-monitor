@@ -119,6 +119,9 @@ class AgentResolutionError(RuntimeError):
 
 
 _TZ_LOCK = threading.Lock()
+_SWEEP_LOG_LOCK = threading.Lock()
+
+
 def timestamp(epoch=None):
     """DST-correct New York time without zoneinfo (works on Python 3.8)."""
     with _TZ_LOCK:
@@ -1054,7 +1057,21 @@ def _delivery_error(directory, text):
         atomic_write(Path(directory) / ".delivery.stderr", _cap(text, STDERR_CAP))
 
 
-def deliver_report(directory, report, config=CONFIG):
+def _sweeper_warning(config, message, error=""):
+    detail = str(message)
+    if error:
+        detail += " error=%s" % " ".join(str(error).split())
+    try:
+        with _SWEEP_LOG_LOCK:
+            log_line(config.home, "WARN", detail, config=config)
+    except OSError:
+        pass
+    print("paseo-monitor: WARN %s" % message, file=sys.stderr)
+    if error:
+        print(error, file=sys.stderr)
+
+
+def deliver_report(directory, report, config=CONFIG, sweeper=False):
     """Push one report through the single optional direct-argv backend."""
     directory = Path(directory)
     spec = read_spec(directory / "spec")
@@ -1067,9 +1084,15 @@ def deliver_report(directory, report, config=CONFIG):
         if not report_to:
             error = "delivery backend requires report_to"
             _delivery_error(directory, error)
-            print("paseo-monitor: WARN delivery-failed watch=%s backend=%s" %
-                  (directory.name, backend), file=sys.stderr)
-            print(error, file=sys.stderr)
+            if sweeper:
+                _sweeper_warning(
+                    config, "delivery-failed watch=%s backend=%s" %
+                    (directory.name, backend), error,
+                )
+            else:
+                print("paseo-monitor: WARN delivery-failed watch=%s backend=%s" %
+                      (directory.name, backend), file=sys.stderr)
+                print(error, file=sys.stderr)
             return False
         argv = [backend, "add", report_to]
     else:
@@ -1093,10 +1116,15 @@ def deliver_report(directory, report, config=CONFIG):
     error = _cap(stderr, STDERR_CAP).decode("utf-8", "replace")
     if rc:
         _delivery_error(directory, error)
-        print("paseo-monitor: WARN delivery-failed watch=%s backend=%s rc=%s" %
-              (directory.name, backend, rc), file=sys.stderr)
-        if error:
-            print(error.rstrip("\n"), file=sys.stderr)
+        message = "delivery-failed watch=%s backend=%s rc=%s" % (
+            directory.name, backend, rc,
+        )
+        if sweeper:
+            _sweeper_warning(config, message, error)
+        else:
+            print("paseo-monitor: WARN %s" % message, file=sys.stderr)
+            if error:
+                print(error.rstrip("\n"), file=sys.stderr)
         return False
     try:
         (directory / ".delivery.stderr").unlink()
@@ -1124,7 +1152,8 @@ def _clear_undelivered(directory):
 
 
 def report_event(directory, classification, old, new, detail, config=CONFIG,
-                 exempt=False, count_fire=True, observed_epoch=None):
+                 exempt=False, count_fire=True, observed_epoch=None,
+                 sweeper=False):
     """Record and attempt one bounded, front-loaded report envelope."""
     directory = Path(directory)
     spec = read_spec(directory / "spec")
@@ -1175,7 +1204,7 @@ def report_event(directory, classification, old, new, detail, config=CONFIG,
     )
     report = _cap_envelope(report)
     log_line(directory, "REPORT", event_id, report, config=config)
-    if deliver_report(directory, report, config):
+    if deliver_report(directory, report, config, sweeper=sweeper):
         if count_fire:
             atomic_write(fires_path, str(fires + 1))
         _clear_undelivered(directory)
@@ -1189,7 +1218,7 @@ def report_event(directory, classification, old, new, detail, config=CONFIG,
     return False
 
 
-def _retry_undelivered(directory, config=CONFIG):
+def _retry_undelivered(directory, config=CONFIG, sweeper=False):
     directory = Path(directory)
     pending = directory / "undelivered"
     if not pending.is_file():
@@ -1209,7 +1238,7 @@ def _retry_undelivered(directory, config=CONFIG):
         set_state(directory, "delivery-expired")
         return False
     report = pending.read_text(encoding="utf-8", errors="replace")
-    if not deliver_report(directory, report, config):
+    if not deliver_report(directory, report, config, sweeper=sweeper):
         error = (directory / ".delivery.stderr").read_text(
             encoding="utf-8", errors="replace"
         ) if (directory / ".delivery.stderr").is_file() else ""
@@ -1236,7 +1265,9 @@ def _retry_undelivered(directory, config=CONFIG):
     return True
 
 
-def _announce_exhaustion(directory, config=CONFIG):
+
+
+def _announce_exhaustion(directory, config=CONFIG, sweeper=False):
     directory = Path(directory)
     spec = read_spec(directory / "spec")
     maximum = _uint(spec.get("max_fires", "0"), 0)
@@ -1250,7 +1281,7 @@ def _announce_exhaustion(directory, config=CONFIG):
     return report_event(
         directory, "exhausted", old, "MAX-FIRES-REACHED",
         "max-fires=%s reached; no further reports will follow" % maximum,
-        config=config, exempt=True,
+        config=config, exempt=True, sweeper=sweeper,
     )
 
 
@@ -1564,15 +1595,16 @@ def _report_requested(spec, classification, token, old):
     return token in requested or _truthy(spec.get("report_transitions", False))
 
 
-def _report_transition(directory, spec, classification, old, observation, config):
+def _report_transition(directory, spec, classification, old, observation, config,
+                       sweeper=False):
     if not _report_requested(spec, classification, observation.token, old):
         return False
     delivered = report_event(
         directory, classification, old, observation.token, observation.detail,
-        config=config, observed_epoch=pm_now(),
+        config=config, observed_epoch=pm_now(), sweeper=sweeper,
     )
     if delivered:
-        _announce_exhaustion(directory, config)
+        _announce_exhaustion(directory, config, sweeper=sweeper)
     return delivered
 
 
@@ -1587,7 +1619,7 @@ def _sweep_watch(directory, config=CONFIG):
     ).strip() if (directory / "state").is_file() else "active"
     now = pm_now()
     if (directory / "undelivered").is_file():
-        if not _retry_undelivered(directory, config):
+        if not _retry_undelivered(directory, config, sweeper=True):
             return True
         state = (directory / "state").read_text().strip() if (directory / "state").is_file() else state
     if state in ("terminal", "expired", "delivery-expired"):
@@ -1601,7 +1633,7 @@ def _sweep_watch(directory, config=CONFIG):
             detail += "; last probe failure %s" % failure
         delivered = report_event(
             directory, "deadline", old, "DEADLINE", detail,
-            config=config, observed_epoch=now,
+            config=config, observed_epoch=now, sweeper=True,
         )
         if delivered:
             set_state(directory, "expired")
@@ -1646,7 +1678,7 @@ def _sweep_watch(directory, config=CONFIG):
                     if (directory / "last").is_file() else "",
                     "UNOBSERVABLE",
                     "class=%s count=%s rc=%s" % (classification, count, rc),
-                    config=config, observed_epoch=now,
+                    config=config, observed_epoch=now, sweeper=True,
                 )
                 if (directory / "undelivered").is_file():
                     set_state(directory, "parked")
@@ -1660,7 +1692,7 @@ def _sweep_watch(directory, config=CONFIG):
                     if (directory / "last").is_file() else "",
                     "UNOBSERVABLE",
                     "class=network count=%s rc=%s" % (count, rc),
-                    config=config, observed_epoch=now,
+                    config=config, observed_epoch=now, sweeper=True,
                 )
             delay = _uint(spec.get("interval", "60"), 60) * min(count + 1, 8) * config.backoff_scale
             atomic_write(directory / "nextDue", now + delay)
@@ -1672,6 +1704,7 @@ def _sweep_watch(directory, config=CONFIG):
             report_event(
                 directory, "health", old, "UNOBSERVABLE",
                 "class=protocol count=1 rc=0", config=config, observed_epoch=now,
+                sweeper=True,
             )
             log_line(directory, "PROBE-FAIL", "class=protocol", "rc=0",
                      "empty-output", "detail=%s" % exc, config=config)
@@ -1694,7 +1727,10 @@ def _sweep_watch(directory, config=CONFIG):
             log_line(directory, "EVENT", "class=%s" % classification,
                      "old=%s" % old, "new=%s" % observation.token,
                      config=config)
-            delivered = _report_transition(directory, spec, classification, old, observation, config)
+            delivered = _report_transition(
+                directory, spec, classification, old, observation, config,
+                sweeper=True,
+            )
             if classification == "terminal" and delivered:
                 set_state(directory, "terminal")
         interval = _uint(spec.get("interval", "60"), 60)
@@ -1829,6 +1865,7 @@ def sweep(config=CONFIG):
         with ThreadPoolExecutor(max_workers=config.sweep_parallelism) as executor:
             for changed in executor.map(lambda path: _sweep_watch(path, config), watch_dirs):
                 processed += int(bool(changed))
+        log_line(config.home, "SWEEP", "processed=%s" % processed, config=config)
         atomic_write(config.home / "sweep.beacon", "%s %s" % (pm_now(), timestamp()))
         return SweepResult(skipped=False, processed=processed)
     finally:

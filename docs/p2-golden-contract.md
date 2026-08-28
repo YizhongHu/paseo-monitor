@@ -58,9 +58,11 @@ Observed tokens, field order, report classes, report details, prohibition
 placement, context field boundaries, marker text, spec key order, default
 values, cadence values, state names, and file contents are not normalized.
 
-A clean sweep creates `sweep.beacon`; it does not emit `sweep.log`, and
-`sweep.lock/` exists only while the lock is held. Those observations are stated
-in `state-layout.txt` rather than fabricated into the fixture. `undelivered`
-and `dwell` are optional files and are listed only when the scenario creates
-them. The report-shape assertions cover the parts whose exact bytes vary with
-runtime timing.
+A clean sweep of the Python entrypoint creates a timestamped `SWEEP` record
+in `sweep.log` and updates `sweep.beacon`; `sweep.lock/` exists only while the
+lock is held. Delivery-failure warnings emitted by the sweeper are also
+recorded in `sweep.log` while remaining on stderr. The frozen shell reference
+implementation retains the historical no-`sweep.log` clean-sweep observation;
+its golden assertions remain unchanged. `undelivered` and `dwell` are optional
+files and are listed only when the scenario creates them. The report-shape
+assertions cover the parts whose exact bytes vary with runtime timing.

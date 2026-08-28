@@ -222,6 +222,19 @@ class FoundationTests(unittest.TestCase):
         )
         result = PM.sweep(sweep_config)
         self.assertFalse(result.skipped)
+        sweep_log = self.root / "sweep.log"
+        self.assertTrue(sweep_log.is_file())
+        self.assertRegex(
+            sweep_log.read_text(),
+            r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d[-+]\d{4} \[\d+\] SWEEP processed=1",
+        )
+        rotating_config = PM.Config(
+            home=self.root, log_max_bytes=1, lock_grace_seconds=0,
+            backoff_scale=0, fast_sweep=True, probe_timeout=1,
+        )
+        PM.sweep(rotating_config)
+        self.assertTrue((self.root / "sweep.log.1").is_file())
+        self.assertFalse(sweep_log.is_file())
         self.assertEqual((watch / "last").read_text().strip(), "RUNNING")
         self.assertEqual((watch / "detail").read_text().strip(), "detail")
         scheduled = int((watch / "nextDue").read_text().strip())
@@ -625,7 +638,13 @@ class DeliveryLifecycleTests(unittest.TestCase):
         with contextlib.redirect_stderr(io.StringIO()) as captured:
             PM.pm_sweep_watch(directory, self.config)
         first = (directory / "undelivered").read_text()
-        self.assertIn("delivery-failed", captured.getvalue())
+        self.assertIn("paseo-monitor: WARN delivery-failed", captured.getvalue())
+        self.assertIn("delivery exploded", captured.getvalue())
+        sweep_log = (self.root / "sweep.log").read_text()
+        self.assertIn("WARN delivery-failed", sweep_log)
+        self.assertIn("watch=%s" % watch_id, sweep_log)
+        self.assertIn("backend=%s" % delivery, sweep_log)
+        self.assertIn("error=delivery exploded 1", sweep_log)
         self.assertIn("MONITOR REPORT", first)
         PM.pm_sweep_watch(directory, self.config)
         PM.pm_sweep_watch(directory, self.config)
