@@ -1952,10 +1952,11 @@ def _cli_args(values):
             path = Path(values[index + 1])
             if not path.is_file():
                 raise ValueError("context file not found: %s" % path)
-            parsed["context"] = path.read_text(encoding="utf-8")
             index += 2
         elif option in takes:
             if index + 1 >= len(values):
+                if option == "--deadline":
+                    raise ValueError("--deadline is required")
                 raise ValueError("%s needs %s" % (option, missing[option]))
             parsed[takes[option]] = values[index + 1]
             index += 2
@@ -2241,15 +2242,6 @@ def _cli_poke(args, config):
     return 0
 
 
-def _teardown_and_archive(directory, config):
-    spec = read_spec(directory / "spec")
-    state = directory.joinpath("state").read_text().strip() if (directory / "state").is_file() else "active"
-    fires = _uint(directory.joinpath("fires").read_text().strip() if (directory / "fires").is_file() else "0", 0)
-    if fires == 0 and state not in ("terminal", "expired", "delivery-expired"):
-        old = directory.joinpath("last").read_text().strip() if (directory / "last").is_file() else "UNOBSERVED"
-        report_event(directory, "cancelled", old, "CANCELLED",
-                     "watch removed before it reported; last observation %s" % old, config=config)
-    return spec
 
 
 def _cli_rm(args, config):
@@ -2280,7 +2272,6 @@ def _cli_rm(args, config):
                 target = watch_target(spec)
                 owner = _owner_display(spec)
                 report_to = spec.get("report_to", "")
-                _teardown_and_archive(directory, config)
                 if remove_watch(directory, config):
                     print("removed watch=%s owner=%s report_to=%s target=%s" %
                           (directory.name, owner, report_to, target))
@@ -2303,7 +2294,6 @@ def _cli_rm(args, config):
         return 1
     try:
         target, owner, report_to = watch_target(spec), _owner_display(spec), spec.get("report_to", "")
-        _teardown_and_archive(directory, config)
         if not remove_watch(directory, config):
             return 1
         print("removed watch=%s owner=%s report_to=%s target=%s" %
