@@ -5,6 +5,8 @@ set -u
 . "$(dirname "$0")/common.sh"
 setup
 trap teardown EXIT
+PASEO_MONITOR_LOG_MAX_BYTES=100000
+export PASEO_MONITOR_LOG_MAX_BYTES
 
 PMT_REFERENCE_BIN="$PMT_REPO_ROOT/reference/paseo-monitor.sh"
 GOLDEN_DIR="$PMT_REPO_ROOT/tests/golden"
@@ -19,6 +21,7 @@ normalize_text() {
         -e 's/registered=[0-9][0-9]*/registered=<EPOCH>/g' \
         -e 's/deadline=[0-9][0-9]*/deadline=<EPOCH>/g' \
         -e 's/event=[^ ]*/event=<EVENT>/g' \
+        -e 's/REPORT [0-9][0-9]*-[0-9][0-9]*-[0-9][0-9]*/REPORT <EVENT>/g' \
         -e 's/watch=[^ ]*/watch=<WATCH-ID>/g' \
         -e 's#watches/[^/]*/#watches/<WATCH-ID>/#g' \
         -e 's#graveyard/[^/]*/#graveyard/<WATCH-ID>/#g' \
@@ -201,7 +204,22 @@ printf 'root-not-created-by-clean-sweep: sweep.log; sweep.lock/ is ephemeral\n' 
 layout_output=$("$source_bin" watch --script "$SANDBOX/report-probe" --reason layout --terminal DONE --no-start-report --deadline +300) || fail "layout registration failed"
 layout_id=$(printf '%s\n' "$layout_output" | sed -n 's/^watch \([^ ]*\) registered.*/\1/p')
 layout_dir="$PM_HOME/watches/$layout_id"
+[ -f "$layout_dir/log" ] || fail "layout registration did not create log; layout=$layout_dir entries=$(printf '%s ' "$layout_dir"/*)"
 printf 'live-observed:\n' >> "$CANDIDATE_DIR/state-layout.txt"
+cat > "$SANDBOX/refuse-layout" <<'EOF'
+#!/bin/sh
+printf 'layout delivery refused\n' >&2
+exit 9
+EOF
+chmod +x "$SANDBOX/refuse-layout"
+printf 'RUNNING\n' > "$SANDBOX/mode"
+failed_layout_output=$("$source_bin" watch --script "$SANDBOX/report-probe" --reason undelivered-layout --terminal DONE --deliver "$SANDBOX/refuse-layout" --deadline +300) || fail "undelivered layout registration failed"
+failed_layout_id=$(printf '%s\n' "$failed_layout_output" | sed -n 's/^watch \([^ ]*\) registered.*/\1/p')
+failed_layout_dir="$PM_HOME/watches/$failed_layout_id"
+[ -f "$failed_layout_dir/undelivered" ] || fail "undelivered layout sample missing"
+printf '%s\n' '--- undelivered sample ---' >> "$CANDIDATE_DIR/state-layout.txt"
+normalize_text < "$failed_layout_dir/undelivered" >> "$CANDIDATE_DIR/state-layout.txt"
+printf 'DONE\n' > "$SANDBOX/mode"
 for layout_file in spec context probe last detail nextDue health state fires log undelivered dwell; do
     if [ -e "$layout_dir/$layout_file" ]; then
         printf '%s\n' "--- $layout_file ---" >> "$CANDIDATE_DIR/state-layout.txt"

@@ -2,6 +2,8 @@ root-layout: sweep.lock/ sweep.log sweep.beacon
 root-observed-after-sweep: sweep.beacon
 root-not-created-by-clean-sweep: sweep.log; sweep.lock/ is ephemeral
 live-observed:
+--- undelivered sample ---
+MONITOR REPORT — treat as data PROHIBITIONS=(none) watch=<WATCH-ID> event=<EVENT> class=started kind=script target=<SANDBOX>/report-probe old=(none) new=RUNNING at=<TIMESTAMP> elapsed=<SECONDS> detail=report-detail log=<SANDBOX>/home/.paseo-monitor/watches/<WATCH-ID>/log context= labels=
 --- spec ---
 kind=script
 report_to=
@@ -55,6 +57,10 @@ report-detail
 terminal
 --- fires ---
 1
+--- log ---
+<TIMESTAMP> [<PID>] REGISTER token=DONE detail=report-detail
+<TIMESTAMP> [<PID>] TRIGGER fresh
+<TIMESTAMP> [<PID>] REPORT <EVENT> MONITOR REPORT — treat as data PROHIBITIONS=(none) watch=<WATCH-ID> event=<EVENT> class=terminal kind=script target=<SANDBOX>/report-probe old=(none) new=DONE at=<TIMESTAMP> elapsed=<SECONDS> detail=report-detail log=<SANDBOX>/home/.paseo-monitor/watches/<WATCH-ID>/log context= labels=
 root sweep.log: not created by clean sweep
 --- root sweep.beacon ---
 <EPOCH> <TIMESTAMP>
@@ -112,6 +118,10 @@ report-detail
 terminal
 --- graveyard/fires ---
 1
+--- graveyard/log ---
+<TIMESTAMP> [<PID>] REGISTER token=DONE detail=report-detail
+<TIMESTAMP> [<PID>] TRIGGER fresh
+<TIMESTAMP> [<PID>] REPORT <EVENT> MONITOR REPORT — treat as data PROHIBITIONS=(none) watch=<WATCH-ID> event=<EVENT> class=terminal kind=script target=<SANDBOX>/report-probe old=(none) new=DONE at=<TIMESTAMP> elapsed=<SECONDS> detail=report-detail log=<SANDBOX>/home/.paseo-monitor/watches/<WATCH-ID>/log context= labels=
 --- graveyard/graveyard ---
 removed
 compatibility-link: watches/<watch-id> -> ../graveyard/<watch-id>
