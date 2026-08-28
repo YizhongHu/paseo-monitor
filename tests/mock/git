@@ -1,0 +1,14 @@
+#!/bin/sh
+printf 'git %s\n' "$*" >> "$MOCK_DIR/calls.log"
+case "${1:-}" in
+    ls-remote)
+        if [ -n "${MOCK_GIT_OUTPUT:-}" ]; then
+            printf '%s\n' "$MOCK_GIT_OUTPUT"
+        elif [ -f "$MOCK_DIR/git.output" ]; then
+            cat "$MOCK_DIR/git.output"
+        fi
+        exit "${MOCK_GIT_RC:-0}"
+        ;;
+esac
+printf 'unsupported git invocation: %s\n' "$*" >&2
+exit 2

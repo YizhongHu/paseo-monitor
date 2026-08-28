@@ -1,0 +1,16 @@
+#!/bin/sh
+printf 'gh %s\n' "$*" >> "$MOCK_DIR/calls.log"
+case "${1:-}" in
+    pr)
+        if [ -n "${MOCK_GH_OUTPUT:-}" ]; then
+            printf '%s\n' "$MOCK_GH_OUTPUT"
+        elif [ -n "${MOCK_GH_STATE:-}" ]; then
+            printf '%s\n' "$MOCK_GH_STATE"
+        elif [ -f "$MOCK_DIR/gh.output" ]; then
+            cat "$MOCK_DIR/gh.output"
+        fi
+        exit "${MOCK_GH_RC:-0}"
+        ;;
+esac
+printf 'unsupported gh invocation: %s\n' "$*" >&2
+exit 2

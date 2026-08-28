@@ -1,0 +1,47 @@
+#!/bin/sh
+# Minimal scripted paseo mock. JSON fixtures are supplied by tests.
+printf 'paseo %s\n' "$*" >> "$MOCK_DIR/calls.log"
+case "${1:-}" in
+    ls)
+        [ "${2:-}" = "--json" ] || exit 2
+        [ -s "$MOCK_DIR/agents.json" ] && cat "$MOCK_DIR/agents.json" || printf '[]\n'
+        ;;
+    inspect)
+        [ "${3:-}" = "--json" ] || exit 2
+        if [ -f "$MOCK_DIR/inspect.json" ]; then cat "$MOCK_DIR/inspect.json"; else printf '{}\n'; fi
+        ;;
+    provider)
+        [ "${2:-}" = "ls" ] && [ "${3:-}" = "--json" ] || exit 2
+        printf '[{"provider":"claude","status":"available","enabled":"Enabled"}]\n'
+        ;;
+    schedule)
+        case "${2:-}" in
+            create)
+                sm_provider=""
+                sm_previous=""
+                for sm_argument in "$@"; do
+                    if [ "$sm_previous" = "--provider" ]; then sm_provider="$sm_argument"; fi
+                    sm_previous="$sm_argument"
+                done
+                [ -n "$sm_provider" ] || {
+                    printf '{"code":"MISSING_PROVIDER","message":"Provider is required"}\n' >&2
+                    exit 1
+                }
+                sm_next="$(cat "$MOCK_DIR/schedule.next" 2>/dev/null || printf '1')"
+                sm_id="mock-schedule-$sm_next"
+                printf '%s\n' "$((sm_next + 1))" > "$MOCK_DIR/schedule.next"
+                printf '%s\n' "${3:-}" > "$MOCK_DIR/schedule.$sm_id"
+                printf '{"id":"%s"}\n' "$sm_id"
+                ;;
+            delete)
+                sm_id="${3:-}"
+                rm -f "$MOCK_DIR/schedule.$sm_id"
+                ;;
+            ls|inspect|logs|pause|resume|run-once|update)
+                printf '[]\n'
+                ;;
+            *) exit 2 ;;
+        esac
+        ;;
+    *) exit 2 ;;
+esac

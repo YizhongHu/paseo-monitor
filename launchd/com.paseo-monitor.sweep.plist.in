@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!-- paseo-monitor: managed launchd agent -->
+    <key>Label</key>
+    <string>com.paseo-monitor.sweep</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>__PASEO_MONITOR_BIN__</string>
+        <string>_sweep</string>
+    </array>
+    <key>WorkingDirectory</key>
+    <string>__PASEO_MONITOR_REPO__</string>
+    <key>StartInterval</key>
+    <integer>60</integer>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PASEO_MONITOR_HOME</key>
+        <string>__PASEO_MONITOR_HOME__</string>
+        <key>PATH</key>
+        <string>__PASEO_MONITOR_PATH__</string>
+    </dict>
+    <key>StandardOutPath</key>
+    <string>__PASEO_MONITOR_HOME__/launchd.stdout</string>
+    <key>StandardErrorPath</key>
+    <string>__PASEO_MONITOR_HOME__/launchd.stderr</string>
+</dict>
+</plist>

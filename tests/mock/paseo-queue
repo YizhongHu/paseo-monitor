@@ -1,0 +1,5 @@
+#!/bin/sh
+# Mock paseo-queue delivery command; captures identity and stdin, never sends.
+printf 'paseo-queue %s\n' "$*" >> "$MOCK_DIR/calls.log"
+cat > "$MOCK_DIR/send.log"
+exit "${MOCK_SEND_RC:-0}"

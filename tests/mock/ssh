@@ -1,0 +1,30 @@
+#!/bin/sh
+# Scripted ssh mock. Each invocation consumes one line: RC<TAB>output.
+printf 'ssh %s\n' "$*" >> "$MOCK_DIR/calls.log"
+ssh_lock="$MOCK_DIR/ssh.lock"
+while ! mkdir "$ssh_lock" 2>/dev/null; do sleep 1; done
+ssh_cleanup() {
+    rmdir "$ssh_lock" 2>/dev/null
+}
+trap 'ssh_cleanup' 0
+trap 'ssh_cleanup; exit 125' 1 2 3 15
+ssh_line=""
+if [ -f "$MOCK_DIR/ssh.script" ]; then
+    IFS= read -r ssh_line < "$MOCK_DIR/ssh.script" || ssh_line=""
+    sed '1d' "$MOCK_DIR/ssh.script" > "$MOCK_DIR/ssh.script.next"
+    mv "$MOCK_DIR/ssh.script.next" "$MOCK_DIR/ssh.script"
+fi
+ssh_cleanup
+trap - 0 1 2 3 15
+ssh_rc="${ssh_line%%$(printf '\t')*}"
+ssh_rest="${ssh_line#*$(printf '\t')}"
+ssh_output="${ssh_rest%%$(printf '\t')*}"
+ssh_err="${ssh_rest#*$(printf '\t')}"
+case "$ssh_line" in *"$(printf '\t')"*) ;; *) ssh_output="${MOCK_SSH_OUTPUT:-}"; ssh_err="" ;; esac
+case "$ssh_rest" in *"$(printf '\t')"*) ;; *) ssh_err="" ;; esac
+case "$ssh_output" in *'\n'*) ssh_output="$(printf '%b\n' "$ssh_output")" ;; esac
+case "$ssh_err" in *'\n'*) ssh_err="$(printf '%b\n' "$ssh_err")" ;; esac
+case "$ssh_rc" in ''|*[!0-9]*) ssh_rc=0 ;; esac
+printf '%s\n' "$ssh_output"
+[ -n "$ssh_err" ] && printf '%s\n' "$ssh_err" >&2
+exit "$ssh_rc"

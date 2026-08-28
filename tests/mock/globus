@@ -1,0 +1,14 @@
+#!/bin/sh
+printf 'globus %s\n' "$*" >> "$MOCK_DIR/calls.log"
+case "${1:-}" in
+    task)
+        if [ -n "${MOCK_GLOBUS_OUTPUT:-}" ]; then
+            printf '%s\n' "$MOCK_GLOBUS_OUTPUT"
+        elif [ -f "$MOCK_DIR/globus.output" ]; then
+            cat "$MOCK_DIR/globus.output"
+        fi
+        exit "${MOCK_GLOBUS_RC:-0}"
+        ;;
+esac
+printf 'unsupported globus invocation: %s\n' "$*" >&2
+exit 2
