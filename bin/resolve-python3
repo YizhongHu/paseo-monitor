@@ -1,0 +1,89 @@
+#!/bin/sh
+# resolve-python3: print one verified absolute Python 3.8+ interpreter.
+#
+# A macOS /usr/bin/python3 shim can print an xcrun error and still exit zero.
+# Acceptance is therefore based only on the probe's stdout marker and version.
+# With arguments, probe exactly those candidates in the supplied order; this is
+# useful for deterministic tests without depending on the host layout.
+
+pm_python_probe='import sys; v=sys.version_info; print("PASEO_MONITOR_PYTHON_OK %d %d" % (v[0], v[1]) if v >= (3, 8) else "PASEO_MONITOR_PYTHON_TOO_OLD %d %d" % (v[0], v[1]))'
+
+pm_python_try() {
+    pm_candidate="$1"
+    [ -x "$pm_candidate" ] || {
+        printf 'paseo-monitor: rejected Python candidate %s (not executable)\n' "$pm_candidate" >&2
+        return 1
+    }
+
+    # Do not use the return code as evidence. A broken shim may return zero;
+    # only the exact marker emitted on stdout can authorize this candidate.
+    pm_output="$("$pm_candidate" -c "$pm_python_probe" </dev/null 2>/dev/null || :)"
+    pm_output_ifs="$IFS"
+    IFS=' 	
+'
+    set -- $pm_output
+    IFS="$pm_output_ifs"
+    if [ "$#" -eq 3 ] && [ "$1" = PASEO_MONITOR_PYTHON_OK ]; then
+        case "$2" in ''|*[!0-9]*) return 1 ;; esac
+        case "$3" in ''|*[!0-9]*) return 1 ;; esac
+        [ "$2" -gt 3 ] || {
+            [ "$2" -eq 3 ] && [ "$3" -ge 8 ] || return 1
+        }
+        printf '%s\n' "$pm_candidate"
+        return 0
+    fi
+    printf 'paseo-monitor: rejected Python candidate %s (stdout: %s)\n' "$pm_candidate" "${pm_output:-<empty>}" >&2
+    return 1
+}
+
+pm_python_path_candidate() {
+    pm_path_dir="$1"
+    [ -n "$pm_path_dir" ] || pm_path_dir=.
+    case "$pm_path_dir" in
+        /*) pm_path_candidate="$pm_path_dir/python3" ;;
+        *)
+            pm_path_abs_dir="$(CDPATH= cd -P -- "$pm_path_dir" 2>/dev/null && pwd)" || return 1
+            pm_path_candidate="$pm_path_abs_dir/python3"
+            ;;
+    esac
+    pm_python_try "$pm_path_candidate"
+}
+
+if [ "$#" -gt 0 ]; then
+    while [ "$#" -gt 0 ]; do
+        pm_python_try "$1" && exit 0
+        shift
+    done
+else
+    # Prefer the system shim when it is healthy; otherwise continue. This is
+    # intentionally before PATH because /usr/bin/python3 is the documented
+    # macOS system candidate, not because its exit status is trusted.
+    pm_python_try /usr/bin/python3 && exit 0
+
+    pm_old_ifs="$IFS"
+    IFS=:
+    for pm_path_dir in ${PATH:-}; do
+        pm_python_path_candidate "$pm_path_dir" && {
+            IFS="$pm_old_ifs"
+            exit 0
+        }
+    done
+    IFS="$pm_old_ifs"
+
+    # Common justified locations outside PATH: Xcode's bundled interpreter,
+    # the user's Anaconda install, and Homebrew's Intel/Apple Silicon paths.
+    for pm_fixed_candidate in \
+        /Applications/Xcode.app/Contents/Developer/usr/bin/python3 \
+        "${HOME:-}/anaconda3/bin/python3" \
+        /opt/homebrew/bin/python3 \
+        /usr/local/bin/python3; do
+        [ "$pm_fixed_candidate" != /anaconda3/bin/python3 ] || continue
+        pm_python_try "$pm_fixed_candidate" && exit 0
+    done
+fi
+
+cat >&2 <<'EOF'
+paseo-monitor: no working Python 3.8+ interpreter found (candidate probes must print the expected stdout marker).
+paseo-monitor: remedy: sudo xcode-select -s /Applications/Xcode.app/Contents/Developer
+EOF
+exit 1

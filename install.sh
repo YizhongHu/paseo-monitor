@@ -11,6 +11,9 @@ PM_LABEL=com.paseo-monitor.sweep
 PM_PLIST="$HOME/Library/LaunchAgents/$PM_LABEL.plist"
 PM_TEMPLATE="$REPO_DIR/launchd/$PM_LABEL.plist.in"
 PM_SKILL_SOURCE="$REPO_DIR/skills/paseo-monitor/SKILL.md"
+PM_PYTHON_RESOLVER="$REPO_DIR/bin/resolve-python3"
+PM_WRAPPER="$HOME/.local/lib/paseo-monitor/paseo-monitor"
+PM_ENTRYPOINT="$HOME/.local/bin/paseo-monitor"
 
 PM_SOURCE_ONLY=1
 export PM_SOURCE_ONLY PASEO_MONITOR_HOME
@@ -43,6 +46,42 @@ pm_install_skills() {
     done
 }
 
+pm_shell_quote() {
+    pm_quote_value="$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"
+    printf "'%s'" "$pm_quote_value"
+}
+
+pm_install_python_wrapper() {
+    [ -x "$PM_PYTHON_RESOLVER" ] || {
+        echo "install.sh: Python resolver missing: $PM_PYTHON_RESOLVER" >&2
+        exit 1
+    }
+    pm_python="$("$PM_PYTHON_RESOLVER")" || {
+        echo "install.sh: cannot install without a verified Python 3.8+ interpreter" >&2
+        exit 1
+    }
+    case "$pm_python" in
+        /*) ;;
+        *) echo "install.sh: resolver returned a non-absolute interpreter: $pm_python" >&2; exit 1 ;;
+    esac
+    pm_python_q="$(pm_shell_quote "$pm_python")"
+    pm_repo_bin_q="$(pm_shell_quote "$REPO_DIR/bin/paseo-monitor")"
+    pm_wrapper_content="#!/bin/sh
+# paseo-monitor: installed launcher with a validated interpreter pin.
+PASEO_MONITOR_PYTHON=$pm_python_q
+export PASEO_MONITOR_PYTHON
+exec $pm_repo_bin_q \"\$@\"
+"
+    pm_atomic_write "$PM_WRAPPER" "$pm_wrapper_content" || {
+        echo "install.sh: failed to write interpreter-pinned launcher: $PM_WRAPPER" >&2
+        exit 1
+    }
+    chmod 755 "$PM_WRAPPER"
+    ln -sf "$PM_WRAPPER" "$PM_ENTRYPOINT"
+    PM_LAUNCH_BIN="$PM_WRAPPER"
+    echo "install.sh: verified Python interpreter: $pm_python"
+}
+
 pm_install_agent() {
     [ "$(id -u)" != 0 ] || {
         echo "install.sh: refusing to run as root" >&2
@@ -59,14 +98,14 @@ pm_install_agent() {
     pm_install_lock
     chmod +x "$REPO_DIR/bin/paseo-monitor"
     mkdir -p "$HOME/.local/bin" "$HOME/Library/LaunchAgents"
-    ln -sf "$REPO_DIR/bin/paseo-monitor" "$HOME/.local/bin/paseo-monitor"
+    pm_install_python_wrapper
     pm_install_skills
     if [ -f "$PM_PLIST" ] && ! grep -q 'paseo-monitor: managed launchd agent' "$PM_PLIST"; then
         echo "install.sh: refusing to replace unmanaged plist: $PM_PLIST" >&2
         exit 1
     fi
     pm_path="$(printf '%s' "${PATH:-}" | sed 's/[\\&|]/\\&/g')"
-    pm_content="$(sed -e "s|__PASEO_MONITOR_BIN__|$REPO_DIR/bin/paseo-monitor|g" \
+    pm_content="$(sed -e "s|__PASEO_MONITOR_BIN__|$PM_LAUNCH_BIN|g" \
         -e "s|__PASEO_MONITOR_REPO__|$REPO_DIR|g" \
         -e "s|__PASEO_MONITOR_HOME__|$PM_HOME|g" \
         -e "s|__PASEO_MONITOR_PATH__|$pm_path|g" "$PM_TEMPLATE")"
@@ -81,11 +120,11 @@ pm_install_agent() {
             exit 1
         }
     fi
-    if ! command -v paseo-monitor >/dev/null 2>&1 || ! paseo-monitor --help >/dev/null 2>&1; then
-        echo "install.sh: FAILED - paseo-monitor is not on PATH or --help failed." >&2
+    if ! [ -x "$PM_ENTRYPOINT" ] || ! "$PM_ENTRYPOINT" --help >/dev/null 2>&1; then
+        echo "install.sh: FAILED - pinned paseo-monitor launcher or --help failed." >&2
         exit 1
     fi
-    echo "install.sh: SUCCESS - installed $HOME/.local/bin/paseo-monitor -> $REPO_DIR/bin/paseo-monitor"
+    echo "install.sh: SUCCESS - installed $PM_ENTRYPOINT -> $PM_WRAPPER -> $REPO_DIR/bin/paseo-monitor"
     echo "install.sh: SUCCESS - launchd agent $PM_LABEL bootstrapped"
 }
 
@@ -107,7 +146,7 @@ pm_uninstall_agent() {
             }
         }
     fi
-    rm -f "$PM_PLIST" "$HOME/.local/bin/paseo-monitor"
+    rm -f "$PM_PLIST" "$PM_ENTRYPOINT" "$PM_WRAPPER"
     echo "install.sh: SUCCESS - launchd agent $PM_LABEL uninstalled"
 }
 
