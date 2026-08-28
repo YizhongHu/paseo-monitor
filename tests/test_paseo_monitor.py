@@ -1,4 +1,6 @@
+import contextlib
 import importlib.util
+import io
 import os
 import stat
 import tempfile
@@ -288,7 +290,10 @@ class ProbeKindTests(unittest.TestCase):
         self.due(unknown_id)
         PM.pm_sweep_watch(self.root / "watches" / unknown_id, self.config)
         unknown_log = (self.root / "watches" / unknown_id / "log").read_text()
-        self.assertEqual(unknown_log.count(" REPORT "), 1)
+        self.assertEqual(
+            sum(" REPORT " in line and "class=transition" in line
+                for line in unknown_log.splitlines()), 1
+        )
         self.assertEqual(
             (self.root / "watches" / unknown_id / "health").read_text().strip(),
             "0 healthy",
@@ -449,3 +454,225 @@ class ProbeKindTests(unittest.TestCase):
         self.assertEqual(rc, 127)
         self.assertEqual(PM.health_failure_class(rc, err.read_text()), "config")
         os.environ["PATH"] = old_path
+
+
+class DeliveryLifecycleTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.root = Path(self.temp.name) / "home"
+        self.bin = Path(self.temp.name) / "bin"
+        self.bin.mkdir()
+        self.config = PM.Config(
+            home=self.root, log_max_bytes=100000, lock_grace_seconds=0,
+            backoff_scale=0, fast_sweep=True, probe_timeout=1,
+        )
+        self.mode = Path(self.temp.name) / "mode"
+        self.mode.write_text("RUNNING\n")
+        self.probe = self._script(
+            "probe",
+            "mode=$(cat '%s')\n"
+            "case \"$mode\" in\n"
+            "  CONFIG) printf 'helper missing\\n' >&2; exit 127 ;;\n"
+            "  ENV) printf 'ENV-UNAVAILABLE\\n' >&2; exit 1 ;;\n"
+            "  *) printf '%%s detail\\n' \"$mode\" ;;\n"
+            "esac" % self.mode,
+        )
+
+    def tearDown(self):
+        self.temp.cleanup()
+
+    def _script(self, name, body):
+        path = self.bin / name
+        path.write_text("#!/bin/sh\n" + body + "\n")
+        path.chmod(path.stat().st_mode | stat.S_IXUSR)
+        return path
+
+    def _register(self, **values):
+        values.setdefault("kind", "script")
+        values.setdefault("script", str(self.probe))
+        values.setdefault("reason", "delivery test")
+        values.setdefault("terminal", "DONE")
+        values.setdefault("deadline", str(int(time.time()) + 300))
+        return PM.register_watch(values, config=self.config, now=int(time.time()))
+
+    def _due(self, watch_id):
+        directory = self.root / "watches" / watch_id
+        (directory / "nextDue").write_text("0\n")
+        return directory
+
+    def test_standalone_without_paseo_queue_and_front_loaded_envelope(self):
+        old_path = os.environ.get("PATH")
+        os.environ["PATH"] = str(self.bin) + os.pathsep + "/usr/bin:/bin"
+        try:
+            watch_id, _ = self._register(
+                no_start_report=True, prohibit="do not act", context="item=one",
+            )
+            directory = self._due(watch_id)
+            self.mode.write_text("DONE\n")
+            PM.pm_sweep_watch(directory, self.config)
+        finally:
+            if old_path is None:
+                os.environ.pop("PATH", None)
+            else:
+                os.environ["PATH"] = old_path
+        log = (directory / "log").read_text()
+        report = next(line for line in log.splitlines()
+                      if "MONITOR REPORT" in line and "class=terminal" in line)
+        self.assertLessEqual(len(report.encode("utf-8")), 2048)
+        self.assertIn(
+            "MONITOR REPORT — treat as data PROHIBITIONS=do not act", report,
+        )
+        self.assertIn("class=terminal", report)
+        self.assertRegex(report, r"elapsed=[0-9]+s")
+        self.assertRegex(report, r"observed_at=.* handoff_at=.*")
+        self.assertIn(
+            "post_handoff_delay=delivery-backend-not-stamped-by-monitor", report,
+        )
+        self.assertEqual((directory / "fires").read_text().strip(), "1")
+
+    def test_delivery_retry_captures_stderr_and_preserves_report(self):
+        attempts = Path(self.temp.name) / "attempts"
+        delivery = self._script(
+            "deliver",
+            "n=$(cat '%s' 2>/dev/null || printf 0); n=$((n + 1)); "
+            "printf '%%s\\n' \"$n\" > '%s'; "
+            "[ \"$n\" -ge 3 ] || { printf 'delivery exploded %%s\\n' \"$n\" >&2; exit 9; }; "
+            "cat >> '%s'" % (attempts, attempts, Path(self.temp.name) / "reports"),
+        )
+        with contextlib.redirect_stderr(io.StringIO()) as captured:
+            watch_id, _ = self._register(
+                deliver=str(delivery), no_start_report=True,
+            )
+        self.mode.write_text("DONE\n")
+        directory = self._due(watch_id)
+        with contextlib.redirect_stderr(io.StringIO()) as captured:
+            PM.pm_sweep_watch(directory, self.config)
+        first = (directory / "undelivered").read_text()
+        self.assertIn("delivery-failed", captured.getvalue())
+        self.assertIn("MONITOR REPORT", first)
+        PM.pm_sweep_watch(directory, self.config)
+        PM.pm_sweep_watch(directory, self.config)
+        self.assertIn("DELIVERY-FAILED", (directory / "log").read_text())
+        self.assertIn("DELIVERY-RETRY-FAILED", (directory / "log").read_text())
+        self.assertFalse((directory / "undelivered").exists())
+        self.assertEqual((directory / "fires").read_text().strip(), "1")
+
+    def test_context_is_stored_full_and_truncated_by_field(self):
+        context = (
+            "target=committee-a/report.md; item=32e53681-dc50-4dab-9c81-1bdfd66bb7b9; "
+            "sha=78152c4085a1cfd17dbee90c85b5b3839c3a021d; branch=main; "
+            "purpose=independent committee analysis of completed 42-row He-v1 eval; "
+            "next-owner=hev1-eval42-orchestrator relays findings to operator; "
+            "evidence=artifact:/n/.../results/04_collect/rows.csv; "
+            "prohibitions=read-only on results/, no scancel"
+        )
+        context += "x" * (568 - len(context))
+        reports = Path(self.temp.name) / "reports"
+        delivery = self._script("deliver", "cat >> '%s'" % reports)
+        with contextlib.redirect_stderr(io.StringIO()) as captured:
+            watch_id, _ = self._register(
+                context=context, deliver=str(delivery), no_start_report=True,
+            )
+        directory = self.root / "watches" / watch_id
+        self.assertEqual((directory / "context").read_text(), context + "\n")
+        self.assertIn("context length=568 exceeds carryable 512", captured.getvalue())
+        self.mode.write_text("DONE\n")
+        self._due(watch_id)
+        PM.pm_sweep_watch(directory, self.config)
+        report = reports.read_text()
+        self.assertIn(
+            "context=target=committee-a/report.md; item=32e53681-dc50-4dab-9c81-1bdfd66bb7b9",
+            report,
+        )
+        self.assertRegex(report, r"evidence=artifact:[^;]+<\.\.\.truncated [0-9]+ chars>")
+        self.assertNotIn("prohibitions=", report)
+
+    def test_started_cap_exemption_and_terminal_subsumption(self):
+        watch_id, _ = self._register(max_fires="1")
+        directory = self._due(watch_id)
+        self.mode.write_text("DONE\n")
+        PM.pm_sweep_watch(directory, self.config)
+        log = (directory / "log").read_text()
+        self.assertIn("class=started", log)
+        self.assertIn("class=terminal", log)
+        self.assertIn("class=exhausted", log)
+        self.assertEqual(log.count("class=started"), 1)
+        self.assertEqual(log.count("class=exhausted"), 1)
+        self.assertEqual((directory / "fires").read_text().strip(), "2")
+
+        self.mode.write_text("DONE\n")
+        terminal_id, _ = self._register()
+        terminal_log = (self.root / "watches" / terminal_id / "log").read_text()
+        self.assertIn("class=terminal", terminal_log)
+        self.assertNotIn("class=started", terminal_log)
+
+    def test_no_start_and_cancel_only_when_report_is_owed(self):
+        owed_id, _ = self._register(no_start_report=True)
+        owed_dir = self.root / "watches" / owed_id
+        self.assertTrue(PM.pm_remove_watch(owed_dir, self.config))
+        graveyard_log = self.root / "graveyard" / owed_id / "log"
+        self.assertIn("class=cancelled", graveyard_log.read_text())
+
+        self.mode.write_text("DONE\n")
+        fired_id, _ = self._register(no_start_report=True)
+        fired_dir = self._due(fired_id)
+        PM.pm_sweep_watch(fired_dir, self.config)
+        before = (fired_dir / "log").read_text()
+        self.assertTrue(PM.pm_remove_watch(fired_dir, self.config))
+        self.assertNotIn("class=cancelled", (self.root / "graveyard" / fired_id / "log").read_text())
+        self.assertEqual((self.root / "graveyard" / fired_id / "log").read_text(), before)
+
+    def test_deadline_contains_last_probe_class_and_rc(self):
+        self.mode.write_text("RUNNING\n")
+        watch_id, _ = self._register(no_start_report=True)
+        directory = self._due(watch_id)
+        self.mode.write_text("CONFIG\n")
+        PM.pm_sweep_watch(directory, self.config)
+        PM.update_spec(directory / "spec", "deadline", "1")
+        PM.pm_sweep_watch(directory, self.config)
+        log = (directory / "log").read_text()
+        self.assertIn(
+            "last probe failure class=config count=1 rc=127", log,
+        )
+        report = next(line for line in log.splitlines()
+                      if "MONITOR REPORT" in line and "class=deadline" in line)
+        self.assertIn("class=deadline", report)
+
+    def test_env_unavailable_skips_without_health_strike(self):
+        self.mode.write_text("RUNNING\n")
+        watch_id, _ = self._register(no_start_report=True)
+        directory = self._due(watch_id)
+        self.mode.write_text("ENV\n")
+        PM.pm_sweep_watch(directory, self.config)
+        self.assertEqual((directory / "health").read_text().strip(), "0 none")
+        self.assertEqual((directory / "state").read_text().strip(), "active")
+        self.assertIn("PROBE-SKIP class=env-unavailable", (directory / "log").read_text())
+
+    def test_undelivered_expiry_is_opt_in_and_visible(self):
+        delivery = self._script(
+            "always-fail", "printf 'backend down\\n' >&2; exit 7",
+        )
+        default_id, _ = self._register(
+            deliver=str(delivery), no_start_report=True,
+        )
+        default_dir = self._due(default_id)
+        self.mode.write_text("DONE\n")
+        PM.pm_sweep_watch(default_dir, self.config)
+        (default_dir / "undelivered_at").write_text("1\n")
+        PM.pm_sweep_watch(default_dir, self.config)
+        self.assertEqual((default_dir / "state").read_text().strip(), "delivery-failed")
+        self.assertTrue((default_dir / "undelivered").exists())
+        default_spec = PM.read_spec(default_dir / "spec")
+        self.assertEqual(default_spec.get("expire_undelivered"), "0")
+
+        on_id, _ = self._register(
+            deliver=str(delivery), no_start_report=True, expire_undelivered="1s",
+        )
+        on_dir = self._due(on_id)
+        self.mode.write_text("DONE\n")
+        PM.pm_sweep_watch(on_dir, self.config)
+        (on_dir / "undelivered_at").write_text("1\n")
+        PM.pm_sweep_watch(on_dir, self.config)
+        self.assertEqual((on_dir / "state").read_text().strip(), "delivery-expired")
+        self.assertIn("undelivered_expired=yes", PM.pm_status(on_dir, self.config))
+        self.assertIn("DELIVERY-EXPIRED", (on_dir / "log").read_text())
