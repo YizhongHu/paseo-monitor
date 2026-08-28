@@ -79,18 +79,16 @@ and not silently discarded.
 
 ## Cutover readiness
 
-Safe acceptance rehearsal is complete in a disposable `PASEO_MONITOR_HOME`:
-the shell rollback entrypoint passed `version`, `--help`, registration, and
-`_sweep`; the installed Python entrypoint passed `version`, `--help`, and
-`_sweep`. A temporary symlink was switched to the shell entrypoint and back to
-the pinned Python launcher; no real watch state was touched.
+Python cutover is complete: the deployed launcher and managed launchd job
+target `bin/paseo-monitor`. The shell implementation remains available as
+`bin/paseo-monitor.sh`, the rollback entrypoint, and its disposable smoke
+(`version`, `--help`, registration, and `_sweep`) passes alongside the Python
+entrypoint.
 
-The production launchd job was intentionally not stopped or reloaded:
-`ISOLATION.md` forbids `launchctl` from development lanes. The current
-`~/.local/bin/paseo-monitor` symlink, pinned Python wrapper, and managed
-`com.paseo-monitor.sweep` plist were inspected and still target the Python
-entrypoint with `_sweep`, `StartInterval=60`, and `RunAtLoad=true`. A live
-launchd stop/reload remains the explicit production-lane-only step.
+Rollback remains prepared but not exercised against the production launchd
+job. A live rollback drill is intentionally still production-lane-only:
+`ISOLATION.md` forbids `launchctl` from development lanes, and this pass did
+not stop or reload the real job or touch real watch state.
 
 ## P5 public CLI and cutover handoff
 
