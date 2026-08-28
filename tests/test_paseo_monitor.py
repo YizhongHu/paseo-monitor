@@ -472,6 +472,8 @@ class DeliveryLifecycleTests(unittest.TestCase):
             "probe",
             "mode=$(cat '%s')\n"
             "case \"$mode\" in\n"
+            "  AUTH) printf 'Permission denied (publickey)\\n' >&2; exit 255 ;;\n"
+            "  NET) printf 'Connection refused\\n' >&2; exit 1 ;;\n"
             "  CONFIG) printf 'helper missing\\n' >&2; exit 127 ;;\n"
             "  ENV) printf 'ENV-UNAVAILABLE\\n' >&2; exit 1 ;;\n"
             "  *) printf '%%s detail\\n' \"$mode\" ;;\n"
@@ -647,6 +649,39 @@ class DeliveryLifecycleTests(unittest.TestCase):
         self.assertEqual((directory / "health").read_text().strip(), "0 none")
         self.assertEqual((directory / "state").read_text().strip(), "active")
         self.assertIn("PROBE-SKIP class=env-unavailable", (directory / "log").read_text())
+
+    def test_auth_parks_network_backs_off_and_deadline_still_fires(self):
+        auth_id, _ = self._register(no_start_report=True)
+        auth_dir = self._due(auth_id)
+        self.mode.write_text("AUTH\n")
+        PM.pm_sweep_watch(auth_dir, self.config)
+        self._due(auth_id)
+        PM.pm_sweep_watch(auth_dir, self.config)
+        self._due(auth_id)
+        PM.pm_sweep_watch(auth_dir, self.config)
+        self.assertEqual((auth_dir / "health").read_text().strip(), "3 auth")
+        self.assertEqual((auth_dir / "state").read_text().strip(), "parked")
+        PM.update_spec(auth_dir / "spec", "deadline", "1")
+        PM.pm_sweep_watch(auth_dir, self.config)
+        self.assertEqual((auth_dir / "state").read_text().strip(), "expired")
+        self.assertIn("class=deadline", (auth_dir / "log").read_text())
+
+        self.mode.write_text("RUNNING\n")
+        network_id, _ = self._register(no_start_report=True)
+        network_dir = self._due(network_id)
+        self.mode.write_text("NET\n")
+        network_config = PM.Config(
+            home=self.root, log_max_bytes=100000, lock_grace_seconds=0,
+            backoff_scale=1, fast_sweep=True, probe_timeout=1,
+        )
+        PM.pm_sweep_watch(network_dir, network_config)
+        self._due(network_id)
+        PM.pm_sweep_watch(network_dir, network_config)
+        self._due(network_id)
+        PM.pm_sweep_watch(network_dir, network_config)
+        self.assertEqual((network_dir / "health").read_text().strip(), "3 network")
+        self.assertEqual((network_dir / "state").read_text().strip(), "active")
+        self.assertGreater(int((network_dir / "nextDue").read_text().strip()), int(time.time()))
 
     def test_undelivered_expiry_is_opt_in_and_visible(self):
         delivery = self._script(
