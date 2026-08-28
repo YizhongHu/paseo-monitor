@@ -22,6 +22,12 @@ against the shell implementation until P3 ports their internal contracts to
 Python tests. `tests/common.sh` retains `source_monitor` solely to support these
 seams.
 
+The compatibility harness defaults to the retained shell entrypoint
+(`PMT_MODE=shell`). This keeps the eight internal seams and the shell-only
+fixture expectations on their established implementation. Python-safe
+implementation behavior is exercised by `tests/test_paseo_monitor.py` and the
+Python-selected P2 golden run (`PMT_BIN=bin/paseo-monitor`).
+
 ## Fixture-only decoupling
 
 The following tests no longer source the monitor implementation. Their durable

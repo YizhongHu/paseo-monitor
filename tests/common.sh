@@ -4,7 +4,19 @@ set -u
 
 PMT_SELF_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
 PMT_REPO_ROOT="$(CDPATH= cd -- "$PMT_SELF_DIR/.." && pwd)"
-PMT_BIN="${PMT_BIN:-$PMT_REPO_ROOT/bin/paseo-monitor}"
+if [ -n "${PMT_BIN:-}" ]; then
+    case "$PMT_BIN" in
+        *.sh) PMT_MODE="${PMT_MODE:-shell}" ;;
+        *) PMT_MODE="${PMT_MODE:-python}" ;;
+    esac
+else
+    PMT_MODE="${PMT_MODE:-shell}"
+fi
+case "$PMT_MODE" in
+    python) PMT_BIN="${PMT_BIN:-$PMT_REPO_ROOT/bin/paseo-monitor}" ;;
+    shell) PMT_BIN="${PMT_BIN:-$PMT_REPO_ROOT/bin/paseo-monitor.sh}" ;;
+    *) echo "unknown PMT_MODE: $PMT_MODE" >&2; exit 2 ;;
+esac
 PMT_MOCK_DIR="$PMT_REPO_ROOT/tests/mock"
 SANDBOX=""
 MOCK_DIR=""

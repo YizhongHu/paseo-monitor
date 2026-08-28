@@ -14,6 +14,10 @@ PMT_PYTHON_DIR=""
 case "$PMT_BIN" in
     *.py|*/paseo-monitor) PMT_PYTHON_DIR=$(dirname "$(command -v python3)") ;;
 esac
+case "$PMT_MODE:$PMT_BIN" in
+    shell:*paseo-monitor.sh|python:*paseo-monitor) ;;
+    *) fail "entrypoint mode mismatch: mode=$PMT_MODE bin=$PMT_BIN" ;;
+esac
 CANDIDATE_DIR="$SANDBOX/candidate"
 mkdir -p "$CANDIDATE_DIR"
 

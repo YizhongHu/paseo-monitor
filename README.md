@@ -210,10 +210,20 @@ watch state.
 
 ## Development
 
-Run the tests with:
+Run the retained shell compatibility suite with:
 
 ```sh
 tests/run-tests.sh
+```
+
+The harness defaults to `PMT_MODE=shell` because the `t-*.sh` suite retains
+shell-internal assertions and is the frozen compatibility contract. Set
+`PMT_MODE=python` (or `PMT_BIN=bin/paseo-monitor`) only when exercising a
+Python-safe fixture against the Python candidate. Python implementation seams
+are covered by:
+
+```sh
+python3 -m unittest discover -s tests -p 'test_paseo_monitor.py'
 ```
 
 Each test creates a fresh temporary sandbox and places mock `paseo`,

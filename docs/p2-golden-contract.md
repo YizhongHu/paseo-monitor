@@ -1,9 +1,10 @@
 # P2 golden contract
 
-`tests/t-31-golden.sh` compares the current executable (`bin/paseo-monitor`)
-with fixtures captured from the frozen shell authority
-(`reference/paseo-monitor.sh`). It runs entirely in the test harness sandbox;
-it never reads or writes the real monitor home.
+`tests/t-31-golden.sh` compares the selected executable (the retained shell
+entrypoint by default, or `PMT_BIN=bin/paseo-monitor` for Python) with fixtures
+captured from the frozen shell authority (`reference/paseo-monitor.sh`). It runs
+entirely in the test harness sandbox; it never reads or writes the real monitor
+home.
 
 Shared CLI and report fixtures live in `tests/golden/`. The state-layout
 fixture is entrypoint-specific: Python uses
