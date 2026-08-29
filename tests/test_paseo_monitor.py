@@ -830,6 +830,21 @@ class DeliveryLifecycleTests(unittest.TestCase):
         self.assertNotIn("class=cancelled", terminal_log)
         self.assertEqual(terminal_log, terminal_before)
 
+    def test_removal_report_exempts_max_fires(self):
+        self.mode.write_text("RUNNING\n")
+        watch_id, _ = self._register(
+            no_start_report=True, report_transitions=True, max_fires="1",
+        )
+        directory = self._due(watch_id)
+        self.mode.write_text("WAITING\n")
+        PM.pm_sweep_watch(directory, self.config)
+        self.assertEqual((directory / "fires").read_text().strip(), "2")
+        self.assertTrue(PM.pm_remove_watch(directory, self.config))
+        graveyard_log = (
+            self.root / "graveyard" / watch_id / "log"
+        ).read_text()
+        self.assertEqual(graveyard_log.count("class=cancelled"), 1)
+
     def test_removal_delivery_failure_survives_in_graveyard_log(self):
         failing = self._script(
             "remove-fail", "printf 'backend gone\\n' >&2; exit 9",

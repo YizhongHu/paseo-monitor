@@ -1818,6 +1818,7 @@ def remove_watch(directory, config=CONFIG):
             directory, "cancelled", old, "CANCELLED",
             "watch removed before it reported; last observation %s" % old,
             config=config, observed_epoch=pm_now(),
+            exempt=True, count_fire=False,
         )
     graveyard = config.home / "graveyard" / directory.name
     graveyard.parent.mkdir(parents=True, exist_ok=True)
