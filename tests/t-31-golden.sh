@@ -31,7 +31,7 @@ normalize_text() {
         -e 's/registered=[0-9][0-9]*/registered=<EPOCH>/g' \
         -e 's/deadline=[0-9][0-9]*/deadline=<EPOCH>/g' \
         -e 's/event=[^ ]*/event=<EVENT>/g' \
-        -e 's/REPORT [0-9][0-9]*-[0-9][0-9]*-[0-9][0-9]*/REPORT <EVENT>/g' \
+        -e 's/REPORT [0-9][^ ]*/REPORT <EVENT>/g' \
         -e 's/watch=[^ ]*/watch=<WATCH-ID>/g' \
         -e 's#watches/[^/]*/#watches/<WATCH-ID>/#g' \
         -e 's#graveyard/[^/]*/#graveyard/<WATCH-ID>/#g' \

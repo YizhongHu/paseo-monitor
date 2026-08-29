@@ -1167,7 +1167,9 @@ def report_event(directory, classification, old, new, detail, config=CONFIG,
     observed_epoch = pm_now() if observed_epoch is None else int(observed_epoch)
     handoff_epoch = pm_now()
     if config.shell_report:
-        event_id = "%s-%s-%s" % (handoff_epoch, os.getpid(), fires + 1)
+        event_id = "%s-%s-%s-%s" % (
+            handoff_epoch, os.getpid(), directory.name, fires + 1
+        )
         time_fields = "at=%s " % timestamp(handoff_epoch)
         reader_fields = ""
     else:

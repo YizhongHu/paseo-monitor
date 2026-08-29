@@ -8,6 +8,7 @@ import subprocess
 import sys
 import tempfile
 import time
+from unittest import mock
 import unittest
 from pathlib import Path
 
@@ -589,6 +590,35 @@ class DeliveryLifecycleTests(unittest.TestCase):
         directory = self.root / "watches" / watch_id
         (directory / "nextDue").write_text("0\n")
         return directory
+
+    def test_shell_report_event_ids_include_watch_identity(self):
+        shell_config = PM.Config(
+            home=self.root, log_max_bytes=100000, lock_grace_seconds=0,
+            backoff_scale=0, fast_sweep=True, probe_timeout=1,
+            shell_report=True,
+        )
+        event_ids = []
+        with mock.patch.object(PM, "pm_now", return_value=1700000000):
+            for _ in range(2):
+                watch_id, _ = PM.register_watch({
+                    "kind": "script", "script": str(self.probe),
+                    "reason": "shell identity", "terminal": "DONE",
+                    "deadline": "1700000300", "no_start_report": True,
+                }, config=shell_config, now=1700000000)
+                directory = self.root / "watches" / watch_id
+                self.assertTrue(PM.report_event(
+                    directory, "terminal", "RUNNING", "DONE", "finished",
+                    config=shell_config, observed_epoch=1700000000,
+                ))
+                report_line = next(
+                    line for line in (directory / "log").read_text().splitlines()
+                    if " REPORT " in line
+                )
+                event_id = report_line.split(" REPORT ", 1)[1].split(" ", 1)[0]
+                self.assertIn("-%s-" % watch_id, event_id)
+                event_ids.append(event_id)
+        self.assertEqual(len(event_ids), 2)
+        self.assertNotEqual(event_ids[0], event_ids[1])
 
     def test_standalone_without_paseo_queue_and_front_loaded_envelope(self):
         old_path = os.environ.get("PATH")
