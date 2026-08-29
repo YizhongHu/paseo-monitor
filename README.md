@@ -33,13 +33,17 @@ Terminal, health, deadline, cancellation, and exhaustion reports bypass
 opt-in. A clean `started` delivery does not clear `--failsafe`; only terminal
 delivery does. If the delivery backend refuses the registration report, the
 watch remains active, warns with the backend's stderr, records `undelivered`,
-and retries on the next sweep.
+and retries on the next sweep. A queue delivery that returns exit 2 with
+`no agent matches` is instead marked `unroutable`: sweeping stops until the
+recipient is fixed and `poke <id>` explicitly retries the preserved report.
 
 `rm <id>` or `rm --all` reports `class=cancelled` with
-`old=<last observed token>` and `new=CANCELLED` when a watch has never fired
-and is not terminal or expired. Removing a watch that already reported stays
-silent; terminal, expired, and parked watches have already reported. `reap`
-stays silent because it removes only terminal or expired watches. `--max-fires
+`old=<last observed token>` and `new=CANCELLED` for every nonterminal,
+nonexpired, nonparked watch, even when it has already delivered intermediate
+reports. The final report makes administrative removal visible and carries the
+last observed token. Terminal, expired, and parked watches have already reached
+an outcome and remain silent on removal. `reap` stays silent because it removes
+only terminal or expired watches. `--max-fires
 N` reports `class=exhausted` with `new=MAX-FIRES-REACHED` once the cap is
 reached, then reporting stops while the watch log continues to record every
 token change. These reports bypass `--report-on` and `--report-transitions`.
@@ -99,6 +103,10 @@ Kind floors and defaults:
 | `git-ref` | 60s | 120s |
 | `pr-merge` | 60s | 300s |
 | `script` | 60s | 60s |
+
+PBS probes treat the live `qstat -f` completion message
+`Job has finished, use -x or -H` as a positive terminal signal and perform a
+historical `qstat -x` lookup for the terminal state and exit details.
 
 For an absence / receipt watch, key `file-exists` to a pre-agreed receipt path:
 

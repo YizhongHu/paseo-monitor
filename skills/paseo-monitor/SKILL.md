@@ -88,9 +88,11 @@ change reports, leaving `--max-fires 1` available for the terminal report.
 
 All lifecycle classes (`started`, `terminal`, `deadline`, `health`, `cancelled`,
 and `exhausted`) bypass `--report-on` and `--report-transitions`. A registration
-delivery failure warns with the backend's stderr, records `undelivered`, and
-leaves the watch active for retry on the next sweep. A clean `started` delivery
-does not clear `--failsafe`; only terminal delivery clears it.
+delivery failure warns with the backend's stderr and records `undelivered`.
+Transient failures leave the watch active for retry; a queue exit 2 containing
+`no agent matches` marks it `unroutable` and stops sweeping until `poke`.
+A clean `started` delivery does not clear `--failsafe`; only terminal delivery
+clears it.
 
 Removing a watch that already reported stays silent; terminal, expired, and
 parked watches have already reported. `reap` stays silent because it removes
@@ -231,9 +233,8 @@ paseo-monitor poke <id>
 paseo-monitor ls
 paseo-monitor rm <id> | --all
 paseo-monitor reap
-```
-
-`poke` probes out of band and resumes a parked watch. `reap` removes only
-watches whose terminal or expired deadline is older than the long retention
-period. Explicit `rm` is the normal cleanup path; terminal state is retained
-for recovery until then.
+`poke` probes out of band and resumes a parked or unroutable watch. For an
+unroutable watch, fix the recipient before poking so the preserved report can
+be retried. `reap` removes only watches whose terminal or expired deadline is
+older than the long retention period. Explicit `rm` is the normal cleanup path;
+terminal state is retained for recovery until then.

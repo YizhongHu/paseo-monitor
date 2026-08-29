@@ -11,6 +11,7 @@ import time
 from unittest import mock
 import unittest
 from pathlib import Path
+from dataclasses import replace
 
 
 MODULE_PATH = Path(__file__).resolve().parents[1] / "bin" / "paseo-monitor"
@@ -393,6 +394,35 @@ class ProbeKindTests(unittest.TestCase):
         self.assertEqual(PM.parse_probe_output(out).token, "COMPLETED")
         self.assertTrue(watch_id)
 
+    def test_pbs_finished_stderr_signal_uses_historical_lookup(self):
+        self.mock(
+            "qstat",
+            "case \"$1\" in\n"
+            "  -f) printf '%s\\n' 'qstat: 1.server Job has finished, use -x or -H "
+            "to obtain historical job information' >&2; exit 0 ;;\n"
+            "  -x) printf '%s\\n' 'Job Id: 1.server' '    job_state = F' "
+            "'    Exit_status = 0'; exit 0 ;;\n"
+            "esac\n"
+            "exit 2",
+        )
+        self.mock(
+            "ssh",
+            "printf '%s\\n' \"$*\" >> \"$MOCK_CALLS\"\n"
+            "shift 5\n"
+            "sh -c \"$1\"",
+        )
+        self.config = replace(self.config, probe_timeout=3)
+        watch_id, observation = self.register({
+            "kind": "pbs", "host": "polaris", "job": "1.server",
+        })
+        self.assertEqual(observation.token, "F")
+        self.assertIn("qstat-x=", observation.detail)
+        self.assertIn("Exit_status = 0", observation.detail)
+        call = self.calls.read_text()
+        self.assertIn("qstat -f", call)
+        self.assertIn("qstat -x", call)
+        self.assertTrue(watch_id)
+
     def test_agent_dwell_is_per_kind_and_idle_facts_are_verbatim(self):
         self.mock("paseo", "cat \"$MOCK_RESPONSE\"")
         self.response.write_text(
@@ -650,6 +680,42 @@ class DeliveryLifecycleTests(unittest.TestCase):
         )
         self.assertEqual((directory / "fires").read_text().strip(), "1")
 
+    def test_unroutable_delivery_stops_sweeps_until_poked(self):
+        attempts = Path(self.temp.name) / "queue-attempts"
+        queue = self._script(
+            "paseo-queue",
+            "n=$(cat '%s' 2>/dev/null || printf 0); n=$((n + 1)); "
+            "printf '%%s\\n' \"$n\" > '%s'; "
+            "[ \"$n\" -gt 1 ] || { printf 'no agent matches \"gone\"\\n' >&2; exit 2; }; "
+            "cat >/dev/null" % (attempts, attempts),
+        )
+        watch_id, _ = self._register(
+            no_start_report=True, report_transitions=True,
+            deliver=str(queue), deliver_mode="queue", report_to="gone",
+        )
+        directory = self._due(watch_id)
+        self.mode.write_text("DONE\n")
+        with contextlib.redirect_stderr(io.StringIO()) as captured:
+            PM.pm_sweep_watch(directory, self.config)
+        self.assertEqual((directory / "state").read_text().strip(), "unroutable")
+        self.assertTrue((directory / "undelivered").is_file())
+        self.assertIn("no agent matches", captured.getvalue())
+        self.assertEqual(attempts.read_text().strip(), "1")
+
+        self.mode.write_text("RUNNING\n")
+        self._due(watch_id)
+        PM.pm_sweep_watch(directory, self.config)
+        self.assertEqual(attempts.read_text().strip(), "1")
+        self.assertEqual((directory / "state").read_text().strip(), "unroutable")
+        with contextlib.redirect_stderr(io.StringIO()) as captured:
+            PM._cli_status([watch_id], self.config)
+        self.assertIn("state=unroutable; fix recipient and poke to retry", captured.getvalue())
+
+        PM._cli_poke([watch_id], self.config)
+        self.assertEqual(attempts.read_text().strip(), "2")
+        self.assertEqual((directory / "state").read_text().strip(), "terminal")
+        self.assertFalse((directory / "undelivered").exists())
+
     def test_delivery_retry_captures_stderr_and_preserves_report(self):
         attempts = Path(self.temp.name) / "attempts"
         delivery = self._script(
@@ -732,21 +798,56 @@ class DeliveryLifecycleTests(unittest.TestCase):
         self.assertIn("class=terminal", terminal_log)
         self.assertNotIn("class=started", terminal_log)
 
-    def test_no_start_and_cancel_only_when_report_is_owed(self):
+    def test_removal_reports_nonterminal_and_silences_terminal(self):
         owed_id, _ = self._register(no_start_report=True)
         owed_dir = self.root / "watches" / owed_id
         self.assertTrue(PM.pm_remove_watch(owed_dir, self.config))
         graveyard_log = self.root / "graveyard" / owed_id / "log"
         self.assertIn("class=cancelled", graveyard_log.read_text())
 
+        self.mode.write_text("RUNNING\n")
+        intermediate_id, _ = self._register(
+            no_start_report=True, report_transitions=True,
+        )
+        intermediate_dir = self._due(intermediate_id)
+        self.mode.write_text("WAITING\n")
+        PM.pm_sweep_watch(intermediate_dir, self.config)
+        self.assertEqual((intermediate_dir / "fires").read_text().strip(), "1")
+        self.assertTrue(PM.pm_remove_watch(intermediate_dir, self.config))
+        intermediate_log = (
+            self.root / "graveyard" / intermediate_id / "log"
+        ).read_text()
+        self.assertEqual(intermediate_log.count("class=cancelled"), 1)
+        self.assertIn("old=WAITING", intermediate_log)
+        self.assertIn("new=CANCELLED", intermediate_log)
+
         self.mode.write_text("DONE\n")
-        fired_id, _ = self._register(no_start_report=True)
-        fired_dir = self._due(fired_id)
-        PM.pm_sweep_watch(fired_dir, self.config)
-        before = (fired_dir / "log").read_text()
-        self.assertTrue(PM.pm_remove_watch(fired_dir, self.config))
-        self.assertNotIn("class=cancelled", (self.root / "graveyard" / fired_id / "log").read_text())
-        self.assertEqual((self.root / "graveyard" / fired_id / "log").read_text(), before)
+        terminal_id, _ = self._register(no_start_report=True)
+        terminal_dir = self.root / "watches" / terminal_id
+        terminal_before = (terminal_dir / "log").read_text()
+        self.assertTrue(PM.pm_remove_watch(terminal_dir, self.config))
+        terminal_log = (self.root / "graveyard" / terminal_id / "log").read_text()
+        self.assertNotIn("class=cancelled", terminal_log)
+        self.assertEqual(terminal_log, terminal_before)
+
+    def test_removal_delivery_failure_survives_in_graveyard_log(self):
+        failing = self._script(
+            "remove-fail", "printf 'backend gone\\n' >&2; exit 9",
+        )
+        self.mode.write_text("RUNNING\n")
+        watch_id, _ = self._register(
+            no_start_report=True, report_transitions=True,
+            deliver=str(failing),
+        )
+        directory = self._due(watch_id)
+        self.mode.write_text("WAITING\n")
+        PM.pm_sweep_watch(directory, self.config)
+        self.assertEqual((directory / "state").read_text().strip(), "delivery-failed")
+        self.assertTrue(PM.pm_remove_watch(directory, self.config))
+        graveyard_log = (self.root / "graveyard" / watch_id / "log").read_text()
+        self.assertIn("class=cancelled", graveyard_log)
+        self.assertIn("DELIVERY-FAILED", graveyard_log)
+        self.assertIn("backend gone", graveyard_log)
 
     def test_deadline_contains_last_probe_class_and_rc(self):
         self.mode.write_text("RUNNING\n")

@@ -903,23 +903,22 @@ Six event classes, and the distinction matters:
 succeeds, through the configured delivery channel. Its envelope carries
 `class=started`, `old=(none)`, and `new=<first observed token>`. A terminal
 first observation subsumes it: only the terminal report is emitted. A delivery
-failure at registration warns with the backend's stderr, records `undelivered`,
-and leaves the watch active for retry. `started` is exempt from `--max-fires` and
+failure at registration warns with the backend's stderr and records
+`undelivered`. Transient failures leave the watch active for retry; a queue
+exit 2 containing `no agent matches` marks it `unroutable` and stops sweeps.
 does not increment `fires`: the cap bounds change reports, so `--max-fires 1`
 still leaves the terminal report available. A clean `started` delivery does not
 clear `--failsafe`; only terminal delivery does. Like every other lifecycle
 class, it bypasses `--report-on` / `--report-transitions`. Pass
 `--no-start-report` to suppress the registration report.
 
-`cancelled` is emitted by explicit `rm <id>` or `rm --all` only while a watch
-still owes a report: it has never fired and is not already terminal or expired.
-Its envelope carries `class=cancelled`, `old=<last observed token>`, and
-`new=CANCELLED`. Removing a watch that already reported is silent; terminal,
-expired, and parked watches have already reported, so announcing removal adds
-duplicate noise. `reap` stays silent because it only removes terminal or
-expired watches, never an active watch whose caller is still waiting. This
-closes the primary risk of unbounded silence without adding a second report to
-a caller who already has the outcome.
+`cancelled` is emitted by explicit `rm <id>` or `rm --all` for every
+nonterminal, nonexpired, nonparked watch, even when it has already delivered
+intermediate reports. Its envelope carries `class=cancelled`,
+`old=<last observed token>`, and `new=CANCELLED`; if delivery fails, the final
+attempt and error remain in the graveyard log. Terminal, expired, and parked
+watches have already reported an outcome, so removal stays silent. `reap`
+stays silent because it only removes terminal or expired watches.
 
 `exhausted` is emitted once when a watch reaches `--max-fires`, with
 `new=MAX-FIRES-REACHED`; it announces that no further reports follow.
@@ -1222,13 +1221,13 @@ own backstop, which is the one path to unbounded silence.
    | **2. Discovery** | a skill convention | Turn-start `paseo-monitor status`, carrying the last-sweep-age header. Rides a habit agents already have. |
    | **3. Optional push** | `paseo-queue`, or any command | `--deliver paseo-queue` when installed, or `--deliver <cmd>`, behind **one** indirection function. |
    | **4. Optional failsafe** | Paseo daemon | `--failsafe`, an independent failure domain. |
-
    When a push backend *is* configured: a failed send sets an `undelivered`
-   flag, re-attempted each sweep until delivered, parked, or past deadline
+   flag and is re-attempted each sweep until delivered, parked, or past deadline
    (~5 lines). At-least-once *attempt* — duplicates are possible, which is why
-   every report carries watch id + event id. Duplicate "job completed" is
-   harmless; exactly-once is a mirage. `delivery-failed` is a **recorded state
-   with a stderr WARN**. Record; do not act.
+   every report carries watch id + event id. A queue exit 2 containing `no agent
+   matches` is permanent for the current recipient: state becomes `unroutable`,
+   sweeping stops, and `poke` is required after the recipient is fixed. Other
+   failures remain `delivery-failed` with a recorded stderr WARN.
 
 **Deliberately deleted: the `paseo send` escalation ladder, wholesale.** It
 implied a delivery guarantee the tool does not have; `paseo send` is the
@@ -1361,8 +1360,7 @@ $PASEO_MONITOR_HOME/            # default ~/.paseo-monitor
     last                        # last observed token
     detail                      # last detail line
     nextDue                     # epoch seconds (jittered)
-    health                      # consecutive failure count + class
-    state                       # active | parked | terminal | expired | delivery-failed
+    state                       # active | parked | terminal | expired | delivery-failed | unroutable
     undelivered                 # flag: report recorded, enqueue not confirmed
     fires                       # delivered report count
     log                         # per-watch event log, rotated

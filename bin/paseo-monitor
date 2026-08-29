@@ -859,9 +859,16 @@ def _spec_probe(directory, spec, out, err, config):
     if kind == "pbs":
         job = _shell_quote(spec.get("job", ""))
         command = (
-            "qstat -f %s || { printf '\\nPASEO_MONITOR_PBS_HISTORICAL\\n'; "
-            "qstat -x %s; :; }"
-        ) % (job, job)
+            "qstat_live=$(qstat -f %s 2>&1); qstat_rc=$?; "
+            "printf '%%s\\n' \"$qstat_live\"; "
+            "case \"$qstat_live\" in "
+            "*\"Job has finished, use -x or -H\"*) "
+            "printf '\\nPASEO_MONITOR_PBS_HISTORICAL\\n'; "
+            "qstat -x %s ;; "
+            "*) if [ \"$qstat_rc\" -ne 0 ]; then "
+            "printf '\\nPASEO_MONITOR_PBS_HISTORICAL\\n'; "
+            "qstat -x %s; fi ;; esac"
+        ) % (job, job, job)
         rc = run_remote_probe(
             out, err, spec.get("host", ""), command, config=config
         )
@@ -1057,6 +1064,9 @@ def _delivery_error(directory, text):
         atomic_write(Path(directory) / ".delivery.stderr", _cap(text, STDERR_CAP))
 
 
+def _delivery_is_unroutable(rc, error):
+    return rc == 2 and "no agent matches" in str(error).lower()
+
 def _sweeper_warning(config, message, error=""):
     detail = str(message)
     if error:
@@ -1114,9 +1124,22 @@ def deliver_report(directory, report, config=CONFIG, sweeper=False):
     except OSError as exc:
         rc, stderr = 127, _as_bytes(str(exc))
     error = _cap(stderr, STDERR_CAP).decode("utf-8", "replace")
+    unroutable_marker = directory / ".delivery.unroutable"
+    unroutable = (
+        (mode == "queue" or backend == "paseo-queue")
+        and _delivery_is_unroutable(rc, error)
+    )
+    if unroutable:
+        atomic_write(unroutable_marker, "1")
+    else:
+        try:
+            unroutable_marker.unlink()
+        except FileNotFoundError:
+            pass
     if rc:
         _delivery_error(directory, error)
-        message = "delivery-failed watch=%s backend=%s rc=%s" % (
+        message = "%s watch=%s backend=%s rc=%s" % (
+            "delivery-unroutable" if unroutable else "delivery-failed",
             directory.name, backend, rc,
         )
         if sweeper:
@@ -1130,16 +1153,20 @@ def deliver_report(directory, report, config=CONFIG, sweeper=False):
         (directory / ".delivery.stderr").unlink()
     except FileNotFoundError:
         pass
+    try:
+        unroutable_marker.unlink()
+    except FileNotFoundError:
+        pass
     return True
 
 
-def _mark_undelivered(directory, report, count_fire):
+def _mark_undelivered(directory, report, count_fire, state="delivery-failed"):
     directory = Path(directory)
     atomic_write(directory / "undelivered", report)
     if not (directory / "undelivered_at").is_file():
         atomic_write(directory / "undelivered_at", str(pm_now()))
     atomic_write(directory / "undelivered_count_fire", "1" if count_fire else "0")
-    set_state(directory, "delivery-failed")
+    set_state(directory, state)
 
 
 def _clear_undelivered(directory):
@@ -1211,12 +1238,15 @@ def report_event(directory, classification, old, new, detail, config=CONFIG,
             atomic_write(fires_path, str(fires + 1))
         _clear_undelivered(directory)
         return True
-    log_line(directory, "DELIVERY-FAILED",
-             (directory / ".delivery.stderr").read_text(
-                 encoding="utf-8", errors="replace"
-             ) if (directory / ".delivery.stderr").is_file() else "",
-             config=config)
-    _mark_undelivered(directory, report, count_fire)
+    error = (directory / ".delivery.stderr").read_text(
+        encoding="utf-8", errors="replace"
+    ) if (directory / ".delivery.stderr").is_file() else ""
+    log_line(directory, "DELIVERY-FAILED", error, config=config)
+    _mark_undelivered(
+        directory, report, count_fire,
+        state="unroutable" if (directory / ".delivery.unroutable").is_file()
+        else "delivery-failed",
+    )
     return False
 
 
@@ -1620,6 +1650,8 @@ def _sweep_watch(directory, config=CONFIG):
         encoding="utf-8"
     ).strip() if (directory / "state").is_file() else "active"
     now = pm_now()
+    if state == "unroutable":
+        return False
     if (directory / "undelivered").is_file():
         if not _retry_undelivered(directory, config, sweeper=True):
             return True
@@ -1780,7 +1812,7 @@ def remove_watch(directory, config=CONFIG):
     state = (directory / "state").read_text().strip() if (directory / "state").is_file() else "active"
     fires = _uint((directory / "fires").read_text().strip()
                   if (directory / "fires").is_file() else "0", 0)
-    if fires == 0 and state not in ("terminal", "expired", "delivery-expired"):
+    if state not in ("terminal", "expired", "delivery-expired", "parked"):
         old = (directory / "last").read_text().strip() if (directory / "last").is_file() else "UNOBSERVED"
         report_event(
             directory, "cancelled", old, "CANCELLED",
@@ -2250,6 +2282,8 @@ def _cli_status(args, config):
         )
         if state == "parked":
             print("paseo-monitor: WARN watch=%s state=parked; will not probe until poked" % directory.name, file=sys.stderr)
+        elif state == "unroutable":
+            print("paseo-monitor: WARN watch=%s state=unroutable; fix recipient and poke to retry" % directory.name, file=sys.stderr)
         elif state == "delivery-failed":
             print("paseo-monitor: WARN watch=%s state=delivery-failed" % directory.name, file=sys.stderr)
         if (directory / "undelivered").is_file():
@@ -2311,9 +2345,10 @@ def _cli_poke(args, config):
     directory = config.home / "watches" / watch_id
     if not (directory / "spec").is_file() or _is_graveyard(directory):
         return _cli_error("watch not found: %s" % watch_id, 1)
-    if (directory / "state").is_file() and directory.joinpath("state").read_text().strip() == "parked":
+    state = (directory / "state").read_text().strip() if (directory / "state").is_file() else "active"
+    if state in ("parked", "unroutable"):
         set_state(directory, "active")
-        log_line(directory, "POKE", "resumed parked watch", config=config)
+        log_line(directory, "POKE", "resumed %s watch" % state, config=config)
     atomic_write(directory / "nextDue", "0")
     _sweep_watch(directory, config)
     return 0
