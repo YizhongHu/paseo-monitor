@@ -71,7 +71,7 @@ paseo-monitor watch --kind <kind> [kind args] --deadline <when> [options]
 paseo-monitor watch --script <file> --reason "<why no kind fits>" --deadline <when> [options]
 paseo-monitor kinds
 paseo-monitor ls
-paseo-monitor status [<id>]
+paseo-monitor status [--mine|<id>]
 paseo-monitor log <id> [-n N] [-f]
 paseo-monitor poke <id>
 paseo-monitor rm <id> | --all | --all-agents
@@ -116,7 +116,17 @@ paseo-monitor watch --kind file-exists --path /scratch/run/receipt --deadline +3
 
 Job-id-keyed watches cannot observe a target that never entered the queue.
 
-`--failsafe` creates a bounded one-shot Paseo schedule in the daemon. Its
+`status --mine` lists only live watches whose explicit `owner` matches
+`$PASEO_AGENT_ID`; `status <id>` remains the precise lookup, and plain
+`status` still lists all live watches. Without `PASEO_AGENT_ID`, `--mine`
+fails rather than guessing an owner.
+
+`--failsafe` creates a bounded one-shot Paseo schedule in the daemon. For
+example, `paseo-monitor watch --kind slurm --host cannon --job 24211558
+--deadline +3600 --failsafe --expires-in 5m --max-runs 1` schedules one
+bounded follow-up that tells a fresh agent to inspect `status` and `log`.
+It is only a liveness backstop: it does not replace the observation probe,
+guarantee delivery, or reconstruct state or routing from its pointer. Its
 pointer-only prompt contains the watch id, the `status`/`log` procedure, and
 the opaque prohibition text, never routing or state. A clean `started` report
 leaves the schedule in place; a clean terminal report removes it. Use

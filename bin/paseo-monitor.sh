@@ -94,8 +94,8 @@ Subcommands:
       Print the bundled kind table.
   ls
       List live watches: kind, target, state, owner, report_to, nextDue, reason.
-  status [<id>]
-      Show watch status and recovery fields, including owner and report_to.
+  status [--mine|<id>]
+      Show all watches, only the caller's watches, or one watch by id.
   log <id> [-n N] [-f]
       Show a watch log, including a removed watch retained in the graveyard.
   poke <id>
@@ -105,6 +105,8 @@ Subcommands:
       --all-agents lists every watch and owner before global removal.
   # rm reports owed active cancellations; reap remains silent.
   # --max-fires reports one exhausted event at the cap and keeps observing.
+  # --failsafe example: watch ... --failsafe --expires-in 5m --max-runs 1
+  # It schedules one bounded status/log check; it does not replace the probe.
   reap
       Drop watches and graveyard entries expired beyond the retention period.
   _sweep
@@ -1847,6 +1849,19 @@ pm_status() {
     [ "$#" -le 1 ] || {
         return 2
     }
+    if [ "$#" -gt 0 ] && [ "$1" = '--mine' ]; then
+        [ -n "${PASEO_AGENT_ID:-}" ] || {
+            printf 'paseo-monitor: status --mine requires PASEO_AGENT_ID\n' >&2
+            return 1
+        }
+        for pms_dir in "$PM_HOME"/watches/*; do
+            [ -f "$pms_dir/spec" ] || continue
+            pm_is_graveyard "$pms_dir" && continue
+            [ "$(pm_spec_value owner "$pms_dir/spec")" = "$PASEO_AGENT_ID" ] || continue
+            pm_status_one "$pms_dir"
+        done
+        return 0
+    fi
     if [ "$#" -gt 0 ]; then
         pms_id="$1"
         pm_validate_watch_id "$pms_id" || {

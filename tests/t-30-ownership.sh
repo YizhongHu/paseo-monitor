@@ -24,6 +24,11 @@ printf '%s\n' "$ls_out" > "$SANDBOX/ls"
 assert_grep "$SANDBOX/ls" 'owner=owner-a.*report_to=route-a.*ours=no' "owner-a attribution"
 assert_grep "$SANDBOX/ls" 'owner=owner-b.*report_to=route-b.*ours=yes' "owner-b attribution"
 
+mine_out="$($PMT_BIN status --mine)" || fail "status --mine failed"
+printf '%s\n' "$mine_out" > "$SANDBOX/mine"
+assert_grep "$SANDBOX/mine" "watch=$second_id" "status --mine includes caller watch"
+if grep -q "watch=$first_id" "$SANDBOX/mine"; then fail "status --mine leaked another owner's watch"; fi
+
 all_out="$($PMT_BIN rm --all)" || fail "owner-b rm --all failed"
 printf '%s\n' "$all_out" > "$SANDBOX/rm-owner"
 assert_grep "$SANDBOX/rm-owner" "removed watch=$second_id owner=owner-b report_to=route-b" "rm reports deletion"

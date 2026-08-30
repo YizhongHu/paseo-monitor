@@ -45,7 +45,9 @@ of the two sandbox restrictions, not the DNS restriction.
 
 ## Ownership and removal
 
-`ls` and `status` show `owner=`, `report_to=`, and `ours=yes|no`. `rm <id>`
+`ls` and `status` show `owner=`, `report_to=`, and `ours=yes|no`. Use
+`status --mine` to list only live watches owned by `$PASEO_AGENT_ID`; plain
+`status` lists all live watches and `status <id>` resolves one watch. `rm <id>`
 removes only the caller's watch; `rm --all` is scoped to the caller. Use
 `rm --all-agents` for cross-owner removal: it lists every live watch with
 owner, `report_to`, and target before removing them. There is no interactive
@@ -66,6 +68,17 @@ registration.
 For a failsafe schedule, `watch` accepts `--provider <provider>` and
 `--provider <provider>/<model>`. If omitted, it uses the calling agent's
 provider, then the first available and enabled provider.
+
+Concrete bounded example:
+
+```sh
+paseo-monitor watch --kind slurm --host cannon --job 24211558 \
+  --deadline +3600 --failsafe --expires-in 5m --max-runs 1
+```
+
+This schedules one follow-up to inspect `status` and `log`. It is a liveness
+backstop only: it does not run the probe or guarantee delivery, and its
+pointer cannot supply missing observation state or routing.
 
 ## Reports
 

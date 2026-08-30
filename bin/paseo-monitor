@@ -1943,8 +1943,8 @@ Subcommands:
       Print the bundled kind table.
   ls
       List live watches: kind, target, state, owner, report_to, nextDue, reason.
-  status [<id>]
-      Show watch status and recovery fields, including owner and report_to.
+  status [--mine|<id>]
+      Show all watches, only the caller's watches, or one watch by id.
   log <id> [-n N] [-f]
       Show a watch log, including a removed watch retained in the graveyard.
   poke <id>
@@ -1954,6 +1954,8 @@ Subcommands:
       --all-agents lists every watch and owner before global removal.
   # rm reports owed active cancellations; reap remains silent.
   # --max-fires reports one exhausted event at the cap and keeps observing.
+  # --failsafe example: watch ... --failsafe --expires-in 5m --max-runs 1
+  # It schedules one bounded status/log check; it does not replace the probe.
   reap
       Drop watches and graveyard entries expired beyond the retention period.
   _sweep
@@ -2262,7 +2264,17 @@ def _cli_status(args, config):
     ensure_dirs(config.home)
     _cli_header(config)
     directories = []
-    if args:
+    if args and args[0] == "--mine":
+        caller = os.environ.get("PASEO_AGENT_ID", "")
+        if not caller:
+            return _cli_error("status --mine requires PASEO_AGENT_ID", 1)
+        directories = [
+            path for path in config.home.joinpath("watches").iterdir()
+            if not path.is_symlink() and (path / "spec").is_file()
+            and not _is_graveyard(path)
+            and read_spec(path / "spec").get("owner", "") == caller
+        ]
+    elif args:
         if not _watch_id_valid(args[0]):
             return _cli_error("invalid watch id: %s" % args[0])
         source = _watch_source(args[0], config)
