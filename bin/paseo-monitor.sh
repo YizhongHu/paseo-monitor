@@ -1763,7 +1763,11 @@ labels=$pwm_labels"
     fi
     rm -f "$pwm_out" "$pwm_err"
     pwm_attempts=$(( (pwm_deadline_epoch - pwm_now + pwm_interval - 1) / pwm_interval ))
-    printf 'delivery is best-effort; caller owns the liveness backstop\n'
+    if [ -n "$pwm_deliver" ]; then
+        printf 'delivery is best-effort; caller owns the liveness backstop\n'
+    else
+        printf 'delivery=none-configured; reports recorded locally only\n'
+    fi
     if [ -f "$pwm_dir/failsafe" ]; then
         printf 'failsafe schedule=%s\n' "$(cat "$pwm_dir/failsafe")"
     else
@@ -1832,9 +1836,15 @@ pm_status_one() {
         "$(pm_watch_owner "$pso_dir")" "$(pm_spec_value report_to "$pso_dir/spec")" \
         "$([ -n "${PASEO_AGENT_ID:-}" ] && [ "$(pm_spec_value owner "$pso_dir/spec")" = "$PASEO_AGENT_ID" ] && printf yes || printf no)" \
         "$pso_health"
-    printf 'last_token=%s last_transition=%s delivery_attempted=%s undelivered=%s delivery_error=%s fires=%s deadline=%s log=%s sweeper_log=%s\n' \
-        "$pso_last" "$pso_transition" "$pso_attempted" "$pso_undelivered" "$pso_delivery_error" "$pso_fires" \
-        "$(pm_spec_value deadline "$pso_dir/spec")" "$PM_HOME/watches/$pso_id/log" "$pso_sweeper_log"
+    if [ -n "$(pm_spec_value deliver "$pso_dir/spec")" ]; then
+        printf 'last_token=%s last_transition=%s delivery_attempted=%s undelivered=%s delivery_error=%s fires=%s deadline=%s log=%s sweeper_log=%s\n' \
+            "$pso_last" "$pso_transition" "$pso_attempted" "$pso_undelivered" "$pso_delivery_error" "$pso_fires" \
+            "$(pm_spec_value deadline "$pso_dir/spec")" "$PM_HOME/watches/$pso_id/log" "$pso_sweeper_log"
+    else
+        printf 'last_token=%s last_transition=%s delivery=none-configured fires=%s deadline=%s log=%s sweeper_log=%s\n' \
+            "$pso_last" "$pso_transition" "$pso_fires" \
+            "$(pm_spec_value deadline "$pso_dir/spec")" "$PM_HOME/watches/$pso_id/log" "$pso_sweeper_log"
+    fi
 }
 
 pm_status() {

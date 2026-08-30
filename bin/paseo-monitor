@@ -1865,16 +1865,31 @@ def status(directory, config=CONFIG):
         attempted = "yes" if " REPORT " in directory.joinpath("log.1").read_text(
             encoding="utf-8", errors="replace"
         ) else "no"
-    return (
+    header = (
         "watch=%s kind=%s target=%s state=%s owner=%s report_to=%s ours=%s health=%s\n"
-        "last_token=%s last_transition=%s delivery_attempted=%s undelivered=%s%s "
-        "delivery_error=%s fires=%s deadline=%s log=%s sweeper_log=%s\n"
         % (
             directory.name, spec.get("kind", ""), watch_target(spec), state,
             _owner_display(spec), spec.get("report_to", ""),
             "yes" if os.environ.get("PASEO_AGENT_ID") and
             spec.get("owner", "") == os.environ.get("PASEO_AGENT_ID") else "no",
-            health, last, transition, attempted, pending, expiry_field, error, fires,
+            health,
+        )
+    )
+    if not spec.get("deliver", ""):
+        return header + (
+            "last_token=%s last_transition=%s delivery=none-configured fires=%s "
+            "deadline=%s log=%s sweeper_log=%s\n"
+            % (
+                last, transition, fires, spec.get("deadline", ""),
+                config.home / "watches" / directory.name,
+                config.home / "sweep.log",
+            )
+        )
+    return header + (
+        "last_token=%s last_transition=%s delivery_attempted=%s undelivered=%s%s "
+        "delivery_error=%s fires=%s deadline=%s log=%s sweeper_log=%s\n"
+        % (
+            last, transition, attempted, pending, expiry_field, error, fires,
             spec.get("deadline", ""),
             config.home / "watches" / directory.name,
             config.home / "sweep.log",
@@ -2232,7 +2247,10 @@ def _cli_watch(args, config):
             print("paseo-monitor: WARN failsafe schedule not created (SCHEDULE_CREATE_FAILED); caller owns the liveness backstop", file=sys.stderr)
             print("paseo schedule create %s --every %s --max-runs 1 --expires-in %s --provider %s --json" %
                   (_shell_quote(prompt), expires, expires, provider or "<provider>"))
-    print("delivery is best-effort; caller owns the liveness backstop")
+    if values.get("deliver"):
+        print("delivery is best-effort; caller owns the liveness backstop")
+    else:
+        print("delivery=none-configured; reports recorded locally only")
     return 0
 
 
