@@ -827,7 +827,7 @@ pm_run_registered_probe() {
             ;;
         pbs)
             prp_job_q="$(pm_remote_shell_quote "$prp_job")"
-            prp_pbs_cmd="qstat -f $prp_job_q || { printf '\\nPASEO_MONITOR_PBS_HISTORICAL\\n'; qstat -x $prp_job_q; :; }"
+            prp_pbs_cmd="qstat -f $prp_job_q || { printf '\\nPASEO_MONITOR_PBS_HISTORICAL\\n'; qstat -x -f $prp_job_q; :; }"
             pm_run_remote_probe "$prp_out" "$prp_err" "$prp_host" \
                 "$prp_pbs_cmd"
             prp_rc=$?
@@ -2152,4 +2152,3 @@ if [ "${PM_SOURCE_ONLY:-0}" -ne 1 ]; then
             ;;
     esac
 fi
-

@@ -384,7 +384,7 @@ class ProbeKindTests(unittest.TestCase):
         call = self.calls.read_text()
         self.assertEqual(call.count("BatchMode=yes"), 1)
         self.assertIn("qstat -f", call)
-        self.assertIn("qstat -x", call)
+        self.assertIn("qstat -x -f", call)
         self.assertNotIn("sacct", call)
         self.assertNotIn("squeue", call)
         self.response.write_text("COMPLETED\n")
@@ -397,10 +397,10 @@ class ProbeKindTests(unittest.TestCase):
     def test_pbs_finished_stderr_signal_uses_historical_lookup(self):
         self.mock(
             "qstat",
-            "case \"$1\" in\n"
-            "  -f) printf '%s\\n' 'qstat: 1.server Job has finished, use -x or -H "
+            "case \"$1:$2\" in\n"
+            "  -f:*) printf '%s\\n' 'qstat: 1.server Job has finished, use -x or -H "
             "to obtain historical job information' >&2; exit 0 ;;\n"
-            "  -x) printf '%s\\n' 'Job Id: 1.server' '    job_state = F' "
+            "  -x:-f) printf '%s\\n' 'Job Id: 1.server' '    job_state = F' "
             "'    Exit_status = 0'; exit 0 ;;\n"
             "esac\n"
             "exit 2",
@@ -420,7 +420,7 @@ class ProbeKindTests(unittest.TestCase):
         self.assertIn("Exit_status = 0", observation.detail)
         call = self.calls.read_text()
         self.assertIn("qstat -f", call)
-        self.assertIn("qstat -x", call)
+        self.assertIn("qstat -x -f", call)
         self.assertTrue(watch_id)
 
     def test_agent_dwell_is_per_kind_and_idle_facts_are_verbatim(self):

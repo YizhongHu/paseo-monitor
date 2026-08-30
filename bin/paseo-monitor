@@ -864,10 +864,10 @@ def _spec_probe(directory, spec, out, err, config):
             "case \"$qstat_live\" in "
             "*\"Job has finished, use -x or -H\"*) "
             "printf '\\nPASEO_MONITOR_PBS_HISTORICAL\\n'; "
-            "qstat -x %s ;; "
+            "qstat -x -f %s ;; "
             "*) if [ \"$qstat_rc\" -ne 0 ]; then "
             "printf '\\nPASEO_MONITOR_PBS_HISTORICAL\\n'; "
-            "qstat -x %s; fi ;; esac"
+            "qstat -x -f %s; fi ;; esac"
         ) % (job, job, job)
         rc = run_remote_probe(
             out, err, spec.get("host", ""), command, config=config
