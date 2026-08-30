@@ -70,7 +70,7 @@ input exceeds that budget.
 
 Lifecycle reports are independent of transition filters: `started` is enabled
 by default, suppressible by `--no-start-report`, cap-exempt, and subsumed by a
-terminal first observation; `cancelled` is emitted on removal for every
+terminal first observation; `watch-removed` is emitted on removal for every
 nonterminal, nonexpired, nonparked watch, including watches with prior
 intermediate reports; `exhausted` is emitted once at `--max-fires` and is
 cap-exempt; deadline reports include the last probe failure class and return

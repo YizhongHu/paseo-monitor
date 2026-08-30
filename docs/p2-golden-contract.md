@@ -36,7 +36,7 @@ executable.
 - `errors.txt`: exact stderr text and exit status for missing deadline,
   script-required flags, cadence-floor rejection, registration probe failure,
   missing `paseo`, and watch-not-found.
-- `reports/*.txt`: delivered `started`, `terminal`, `deadline`, `cancelled`,
+- `reports/*.txt`: delivered `started`, `terminal`, `deadline`, `watch-removed`,
   and `exhausted` envelopes. The test also asserts the front-loaded
   `PROHIBITIONS` field, a numeric `elapsed=<seconds>s`, a maximum 2048-byte
   envelope, and field-wise context truncation for the long-context case.

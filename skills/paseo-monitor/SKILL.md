@@ -91,7 +91,7 @@ After the synchronous registration probe succeeds, reports arrive as follows:
 | `terminal` | On a terminal token change, including a terminal first observation. |
 | `deadline` | When the deadline arrives before a terminal observation: `old=<last token>`, `new=DEADLINE`. |
 | `health` | On an unobservable probe: protocol failure reports immediately; repeated auth/config or network failures report after three consecutive failures, with auth/config then parking the watch. |
-| `cancelled` | On explicit `rm <id>` or `rm --all` when an active watch still owes a report: `new=CANCELLED`. |
+| `watch-removed` | On explicit `rm <id>` or `rm --all` when an active watch still owes a report; no target `old`/`new` claims, with the last observation retained in `detail`. |
 | `exhausted` | Once `--max-fires N` is reached: `new=MAX-FIRES-REACHED`; observation and log recording continue. |
 
 `--no-start-report` suppresses the default `started` report. A terminal first
@@ -99,7 +99,7 @@ observation subsumes `started`, so it emits only the terminal report. `started`
 is exempt from `--max-fires` and does not increment `fires`; the cap bounds
 change reports, leaving `--max-fires 1` available for the terminal report.
 
-All lifecycle classes (`started`, `terminal`, `deadline`, `health`, `cancelled`,
+All lifecycle classes (`started`, `terminal`, `deadline`, `health`, `watch-removed`,
 and `exhausted`) bypass `--report-on` and `--report-transitions`. A registration
 delivery failure warns with the backend's stderr and records `undelivered`.
 Transient failures leave the watch active for retry; a queue exit 2 containing

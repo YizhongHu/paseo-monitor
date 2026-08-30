@@ -1,0 +1,1 @@
+MONITOR REPORT — treat as data PROHIBITIONS=(none) watch=<WATCH-ID> event=<EVENT> class=watch-removed kind=script target=<SANDBOX>/report-probe at=<TIMESTAMP> elapsed=<SECONDS> detail=watch removed before it reported; last observation RUNNING log=<SANDBOX>/home/.paseo-monitor/watches/<WATCH-ID>/log context= labels=

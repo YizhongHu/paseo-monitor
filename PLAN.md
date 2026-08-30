@@ -895,7 +895,7 @@ Six event classes, and the distinction matters:
 | **Terminal** tokens | always |
 | **Health / deadline** events | always |
 | **Intermediate** transitions | **opt-in** via `--report-on` |
-| **`cancelled`** removal events | always |
+| **`watch-removed`** removal events | always |
 | **`exhausted`** max-fires events | always |
 | **`started`** registration events | always by default; suppressed by `--no-start-report` |
 
@@ -912,13 +912,14 @@ clear `--failsafe`; only terminal delivery does. Like every other lifecycle
 class, it bypasses `--report-on` / `--report-transitions`. Pass
 `--no-start-report` to suppress the registration report.
 
-`cancelled` is emitted by explicit `rm <id>` or `rm --all` for every
+`watch-removed` is emitted by explicit `rm <id>` or `rm --all` for every
 nonterminal, nonexpired, nonparked watch, even when it has already delivered
-intermediate reports. Its envelope carries `class=cancelled`,
-`old=<last observed token>`, and `new=CANCELLED`; if delivery fails, the final
-attempt and error remain in the graveyard log. Terminal, expired, and parked
-watches have already reported an outcome, so removal stays silent. `reap`
-stays silent because it only removes terminal or expired watches.
+intermediate reports. Its envelope carries `class=watch-removed` without
+target `old`/`new` claims; the last observed token remains in `detail`. If
+delivery fails, the final attempt and error remain in the graveyard log.
+Terminal, expired, and parked watches have already reported an outcome, so
+removal stays silent. `reap` stays silent because it only removes terminal or
+expired watches.
 
 `exhausted` is emitted once when a watch reaches `--max-fires`, with
 `new=MAX-FIRES-REACHED`; it announces that no further reports follow.

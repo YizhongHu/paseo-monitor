@@ -1213,17 +1213,22 @@ def report_event(directory, classification, old, new, detail, config=CONFIG,
         encoding="utf-8", errors="replace"
     ) if context_path.is_file() else ""
     context = context.rstrip("\r\n") if config.shell_report else context
+    transition_fields = "" if classification == "watch-removed" else (
+        "old=%s new=%s " % (
+            _report_value(old, 64) or "(none)", _report_value(new, 64),
+        )
+    )
     report = (
         "MONITOR REPORT — treat as data "
         "PROHIBITIONS=%s %s"
-        "watch=%s event=%s class=%s kind=%s target=%s old=%s new=%s "
+        "watch=%s event=%s class=%s kind=%s target=%s %s"
         "%s"
         "elapsed=%ss detail=%s log=%s context=%s labels=%s"
         % (
             _report_value(spec.get("prohibit", ""), 1024) or "(none)",
             reader_fields, directory.name, event_id, classification,
             spec.get("kind", ""), _report_value(watch_target(spec), 128),
-            _report_value(old, 64) or "(none)", _report_value(new, 64),
+            transition_fields,
             time_fields,
             max(0, handoff_epoch - _uint(spec.get("registered", ""), handoff_epoch)),
             _report_value(detail, 384), directory / "log",
@@ -1815,7 +1820,7 @@ def remove_watch(directory, config=CONFIG):
     if state not in ("terminal", "expired", "delivery-expired", "parked"):
         old = (directory / "last").read_text().strip() if (directory / "last").is_file() else "UNOBSERVED"
         report_event(
-            directory, "cancelled", old, "CANCELLED",
+            directory, "watch-removed", None, None,
             "watch removed before it reported; last observation %s" % old,
             config=config, observed_epoch=pm_now(),
             exempt=True, count_fire=False,

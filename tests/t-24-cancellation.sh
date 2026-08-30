@@ -11,7 +11,7 @@ cat > "$SANDBOX/probe" <<'EOF'
 if [ -f "$MOCK_DIR/done" ]; then
     printf 'DONE terminal\n'
 else
-    printf 'RUNNING active\n'
+    cat "$MOCK_DIR/mode" 2>/dev/null || printf 'RUNNING active\n'
 fi
 EOF
 chmod +x "$SANDBOX/probe"
@@ -36,9 +36,24 @@ assert_eq "$(cat "$active_dir/last")" RUNNING "active last token"
 $PMT_BIN rm "$active_id" || fail "active rm failed"
 assert_eq "$(count_reports "$MOCK_DIR/reports")" 1 "active cancellation report count"
 assert_grep "$MOCK_DIR/reports" "watch=$active_id" "active cancellation watch"
-assert_grep "$MOCK_DIR/reports" 'class=cancelled' "active cancellation class"
-assert_grep "$MOCK_DIR/reports" 'old=RUNNING' "active cancellation old token"
-assert_grep "$MOCK_DIR/reports" 'new=CANCELLED' "active cancellation new token"
+assert_grep "$MOCK_DIR/reports" 'class=watch-removed' "active removal class"
+assert_grep "$MOCK_DIR/reports" 'detail=watch removed before it reported; last observation RUNNING' "active removal detail"
+if grep -qE '(^| )(old|new)=' "$MOCK_DIR/reports"; then
+    fail "watch removal report claimed a target transition"
+fi
+
+# Removal remains deliverable after the change-report cap is reached.
+: > "$MOCK_DIR/reports"
+printf 'RUNNING active\n' > "$MOCK_DIR/mode"
+capped_reg="$($PMT_BIN watch --script "$SANDBOX/probe" --reason 'cap then remove' --terminal DONE --no-start-report --report-transitions --max-fires 1 --deliver "$SANDBOX/deliver" --deadline +300)" || fail "capped registration failed"
+capped_id=$(printf '%s\n' "$capped_reg" | sed -n 's/^watch \([^ ]*\) registered.*/\1/p')
+capped_dir="$PM_HOME/watches/$capped_id"
+printf 'WAITING active\n' > "$MOCK_DIR/mode"
+printf '0\n' > "$capped_dir/nextDue"
+$PMT_BIN _sweep || fail "capped transition sweep failed"
+$PMT_BIN rm "$capped_id" || fail "capped rm failed"
+assert_grep "$MOCK_DIR/reports" "watch=$capped_id.*class=watch-removed" "capped removal report"
+assert_grep "$MOCK_DIR/reports" 'last observation WAITING' "capped removal detail"
 
 # A watch that already delivered its terminal event does not report again on rm.
 : > "$MOCK_DIR/reports"
@@ -58,9 +73,9 @@ all_one_id=$(printf '%s\n' "$all_one_reg" | sed -n 's/^watch \([^ ]*\) registere
 all_two_reg="$($PMT_BIN watch --script "$SANDBOX/probe" --reason 'bulk cancellation two' --terminal DONE --no-start-report --deliver "$SANDBOX/deliver" --deadline +300)" || fail "bulk two registration failed"
 all_two_id=$(printf '%s\n' "$all_two_reg" | sed -n 's/^watch \([^ ]*\) registered.*/\1/p')
 $PMT_BIN rm --all || fail "bulk rm failed"
-assert_eq "$(count_reports "$MOCK_DIR/reports")" 2 "bulk cancellation report count"
-assert_grep "$MOCK_DIR/reports" "watch=$all_one_id.*class=cancelled" "bulk first cancellation"
-assert_grep "$MOCK_DIR/reports" "watch=$all_two_id.*class=cancelled" "bulk second cancellation"
+assert_eq "$(count_reports "$MOCK_DIR/reports")" 2 "bulk removal report count"
+assert_grep "$MOCK_DIR/reports" "watch=$all_one_id.*class=watch-removed" "bulk first removal"
+assert_grep "$MOCK_DIR/reports" "watch=$all_two_id.*class=watch-removed" "bulk second removal"
 
 # Removing a failsafe watch releases the daemon schedule before its directory vanishes.
 failsafe_reg="$($PMT_BIN watch --script "$SANDBOX/probe" --reason 'rm failsafe cleanup' --terminal DONE --no-start-report --failsafe --provider claude --max-runs 1 --expires-in 5m --deliver "$SANDBOX/deliver" --deadline +300)" || fail "rm failsafe registration failed"

@@ -187,7 +187,7 @@ printf 'RUNNING\n' > "$SANDBOX/mode"
 cancel_output=$("$source_bin" watch --script "$SANDBOX/report-probe" --reason report-cancelled --terminal DONE --no-start-report --deliver "$SANDBOX/deliver" --deadline +300) || fail "cancel registration failed"
 cancel_id=$(printf '%s\n' "$cancel_output" | sed -n 's/^watch \([^ ]*\) registered.*/\1/p')
 "$source_bin" rm "$cancel_id" > /dev/null || fail "cancel removal failed"
-capture_report cancelled "$CANDIDATE_DIR/report-cancelled.txt"
+capture_report watch-removed "$CANDIDATE_DIR/report-watch-removed.txt"
 
 printf 'RUNNING\n' > "$SANDBOX/mode"
 exhausted_output=$("$source_bin" watch --script "$SANDBOX/report-probe" --reason report-exhausted --terminal DONE --no-start-report --max-fires 1 --deliver "$SANDBOX/deliver" --deadline +300) || fail "exhaustion registration failed"
@@ -322,7 +322,7 @@ if [ "$bless" -eq 1 ]; then
     cp "$CANDIDATE_DIR/specs.txt" "$GOLDEN_DIR/specs.txt"
     cp "$CANDIDATE_DIR/state-layout.txt" "$golden_state_layout"
     cp "$CANDIDATE_DIR/surface-agreement.txt" "$GOLDEN_DIR/surface-agreement.txt"
-    for report_class in started terminal deadline cancelled exhausted; do
+    for report_class in started terminal deadline watch-removed exhausted; do
         cp "$CANDIDATE_DIR/report-$report_class.txt" "$GOLDEN_DIR/reports/$report_class.txt"
     done
     echo 'PASS: blessed golden fixtures from reference implementation'
@@ -337,7 +337,7 @@ for golden_file in help.txt kinds.txt errors.txt specs.txt state-layout.txt surf
         fail "golden drift: $golden_file"
     }
 done
-for report_class in started terminal deadline cancelled exhausted; do
+for report_class in started terminal deadline watch-removed exhausted; do
     cmp -s "$CANDIDATE_DIR/report-$report_class.txt" "$GOLDEN_DIR/reports/$report_class.txt" || {
         diff -u "$GOLDEN_DIR/reports/$report_class.txt" "$CANDIDATE_DIR/report-$report_class.txt" >&2
         fail "golden drift: report-$report_class.txt"

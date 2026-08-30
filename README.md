@@ -37,13 +37,12 @@ and retries on the next sweep. A queue delivery that returns exit 2 with
 `no agent matches` is instead marked `unroutable`: sweeping stops until the
 recipient is fixed and `poke <id>` explicitly retries the preserved report.
 
-`rm <id>` or `rm --all` reports `class=cancelled` with
-`old=<last observed token>` and `new=CANCELLED` for every nonterminal,
+`rm <id>` or `rm --all` reports `class=watch-removed` for every nonterminal,
 nonexpired, nonparked watch, even when it has already delivered intermediate
-reports. The final report makes administrative removal visible and carries the
-last observed token. Terminal, expired, and parked watches have already reached
-an outcome and remain silent on removal. `reap` stays silent because it removes
-only terminal or expired watches. `--max-fires
+reports. The removal report carries no target `old`/`new` transition claims;
+the last observed token remains in `detail`. Terminal, expired, and parked
+watches have already reached an outcome and remain silent on removal. `reap`
+stays silent because it removes only terminal or expired watches. `--max-fires
 N` reports `class=exhausted` with `new=MAX-FIRES-REACHED` once the cap is
 reached, then reporting stops while the watch log continues to record every
 token change. These reports bypass `--report-on` and `--report-transitions`.

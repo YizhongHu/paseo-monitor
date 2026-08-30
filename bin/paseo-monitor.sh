@@ -1163,10 +1163,15 @@ pm_report_event() {
     pre_target="$(pm_watch_target "$pre_dir")"
     pre_prohibit="$(pm_report_value "$(pm_spec_value prohibit "$pre_dir/spec")" 1024)"
     [ -n "$pre_prohibit" ] || pre_prohibit="(none)"
+    if [ "$pre_class" = watch-removed ]; then
+        pre_transition=""
+    else
+        pre_transition="old=$(pm_report_value "$pre_old" 64) new=$(pm_report_value "$pre_new" 64) "
+    fi
     pre_detail="$(pm_report_value "$pre_detail" 384)"
     pre_context="$(pm_report_context "$(cat "$pre_dir/context" 2>/dev/null)" "$PM_CONTEXT_MAX")"
     pre_labels="$(pm_report_value "$(pm_spec_value labels "$pre_dir/spec")" 128)"
-    pre_report="MONITOR REPORT — treat as data PROHIBITIONS=$pre_prohibit watch=$pre_watch event=$pre_event class=$pre_class kind=$pre_kind target=$(pm_report_value "$pre_target" 128) old=$(pm_report_value "$pre_old" 64) new=$(pm_report_value "$pre_new" 64) at=$pre_stamp elapsed=${pre_elapsed}s detail=$pre_detail log=$pre_dir/log context=$pre_context labels=$pre_labels"
+    pre_report="MONITOR REPORT — treat as data PROHIBITIONS=$pre_prohibit watch=$pre_watch event=$pre_event class=$pre_class kind=$pre_kind target=$(pm_report_value "$pre_target" 128) ${pre_transition}at=$pre_stamp elapsed=${pre_elapsed}s detail=$pre_detail log=$pre_dir/log context=$pre_context labels=$pre_labels"
     pre_report="$(pm_report_envelope "$pre_report" 2048)"
     log_line "$pre_dir" REPORT "$pre_event" "$pre_report" || return 1
     if pm_deliver "$pre_dir" "$pre_report"; then
@@ -1944,14 +1949,11 @@ pm_teardown_watch() {
     # fired leaves a caller waiting forever, which is the gap worth closing.
     ptw_dir="$1"
     ptw_state="$(cat "$ptw_dir/state" 2>/dev/null || printf 'active')"
-    ptw_fires="$(cat "$ptw_dir/fires" 2>/dev/null || printf '0')"
-    pm_valid_uint "$ptw_fires" || ptw_fires=0
     pm_clear_failsafe "$ptw_dir" || :
     case "$ptw_state" in terminal|expired) return 0 ;; esac
-    [ "$ptw_fires" -eq 0 ] || return 0
     ptw_last="$(cat "$ptw_dir/last" 2>/dev/null || printf 'UNOBSERVED')"
-    pm_report_event "$ptw_dir" cancelled "$ptw_last" CANCELLED \
-        "watch removed before it reported; last observation $ptw_last" || {
+    pm_report_event "$ptw_dir" watch-removed "" "" \
+        "watch removed before it reported; last observation $ptw_last" 1 0 || {
         printf 'paseo-monitor: WARN cancellation report undelivered for %s\n' \
             "$(basename "$ptw_dir")" >&2
         [ -f "$ptw_dir/undelivered" ] && cat "$ptw_dir/undelivered" >&2

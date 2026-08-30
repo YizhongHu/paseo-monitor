@@ -803,7 +803,10 @@ class DeliveryLifecycleTests(unittest.TestCase):
         owed_dir = self.root / "watches" / owed_id
         self.assertTrue(PM.pm_remove_watch(owed_dir, self.config))
         graveyard_log = self.root / "graveyard" / owed_id / "log"
-        self.assertIn("class=cancelled", graveyard_log.read_text())
+        owed_report = graveyard_log.read_text()
+        self.assertIn("class=watch-removed", owed_report)
+        self.assertNotRegex(owed_report, r"\b(?:old|new)=")
+        self.assertIn("last observation RUNNING", owed_report)
 
         self.mode.write_text("RUNNING\n")
         intermediate_id, _ = self._register(
@@ -817,9 +820,13 @@ class DeliveryLifecycleTests(unittest.TestCase):
         intermediate_log = (
             self.root / "graveyard" / intermediate_id / "log"
         ).read_text()
-        self.assertEqual(intermediate_log.count("class=cancelled"), 1)
-        self.assertIn("old=WAITING", intermediate_log)
-        self.assertIn("new=CANCELLED", intermediate_log)
+        self.assertEqual(intermediate_log.count("class=watch-removed"), 1)
+        intermediate_report = next(
+            line for line in intermediate_log.splitlines()
+            if "class=watch-removed" in line
+        )
+        self.assertNotRegex(intermediate_report, r"\b(?:old|new)=")
+        self.assertIn("last observation WAITING", intermediate_report)
 
         self.mode.write_text("DONE\n")
         terminal_id, _ = self._register(no_start_report=True)
@@ -827,7 +834,7 @@ class DeliveryLifecycleTests(unittest.TestCase):
         terminal_before = (terminal_dir / "log").read_text()
         self.assertTrue(PM.pm_remove_watch(terminal_dir, self.config))
         terminal_log = (self.root / "graveyard" / terminal_id / "log").read_text()
-        self.assertNotIn("class=cancelled", terminal_log)
+        self.assertNotIn("class=watch-removed", terminal_log)
         self.assertEqual(terminal_log, terminal_before)
 
     def test_removal_report_exempts_max_fires(self):
@@ -843,7 +850,7 @@ class DeliveryLifecycleTests(unittest.TestCase):
         graveyard_log = (
             self.root / "graveyard" / watch_id / "log"
         ).read_text()
-        self.assertEqual(graveyard_log.count("class=cancelled"), 1)
+        self.assertEqual(graveyard_log.count("class=watch-removed"), 1)
 
     def test_removal_delivery_failure_survives_in_graveyard_log(self):
         failing = self._script(
@@ -860,7 +867,11 @@ class DeliveryLifecycleTests(unittest.TestCase):
         self.assertEqual((directory / "state").read_text().strip(), "delivery-failed")
         self.assertTrue(PM.pm_remove_watch(directory, self.config))
         graveyard_log = (self.root / "graveyard" / watch_id / "log").read_text()
-        self.assertIn("class=cancelled", graveyard_log)
+        removal_report = next(
+            line for line in graveyard_log.splitlines()
+            if "class=watch-removed" in line
+        )
+        self.assertNotRegex(removal_report, r"\b(?:old|new)=")
         self.assertIn("DELIVERY-FAILED", graveyard_log)
         self.assertIn("backend gone", graveyard_log)
 
