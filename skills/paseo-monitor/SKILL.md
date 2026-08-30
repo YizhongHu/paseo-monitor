@@ -27,6 +27,7 @@ paseo-monitor watch --kind slurm --host cannon --job 24211558 --deadline +3600
 `--report-to` defaults to `$PASEO_AGENT_ID`. Reports go to the caller's queue
 when `--deliver paseo-queue` is selected; without a delivery backend,
 registration records the watch and its reports locally.
+`status` reports `delivery=none-configured` and omits delivery-attempt fields when no backend is configured; reports remain in the local watch log only.
 
 ### Sandboxed callers
 

@@ -142,8 +142,10 @@ printf '%s\n' "$status_output" > "$SANDBOX/status"
 assert_grep "$SANDBOX/status" 'last-sweep-age:' "status freshness header"
 assert_grep "$SANDBOX/status" 'last_token=DONE' "status last token"
 assert_grep "$SANDBOX/status" 'last_transition=' "status transition time"
-assert_grep "$SANDBOX/status" 'delivery_attempted=yes' "status delivery attempted"
-assert_grep "$SANDBOX/status" 'undelivered=no' "status undelivered flag"
+assert_grep "$SANDBOX/status" 'delivery=none-configured' "status local-only delivery"
+if grep -q 'delivery_attempted=\|undelivered=\|delivery_error=' "$SANDBOX/status"; then
+    fail "local-only status emitted configured-delivery fields"
+fi
 assert_grep "$SANDBOX/status" 'health=0 healthy' "status health"
 
 echo PASS: deadline, auth park, network backoff, env skip, poke, retention, and status

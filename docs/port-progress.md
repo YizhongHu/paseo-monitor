@@ -38,7 +38,7 @@ beside the retained shell rollback entrypoint:
 - Slurm uses `sacct -X` as the authoritative state, preserves accounting-lag
   `PENDING`, extracts first-word terminal states, gates `VANISHED` on prior
   queue evidence, and optionally bundles `squeue` reason data in one SSH call.
-- PBS keeps its isolated `qstat -f`/`qstat -x` path; a live completion message
+- PBS keeps its isolated `qstat -f`/`qstat -x -f` path; a live completion message
   triggers the historical lookup so terminal state and exit details remain
   observable. Globus preserves API status/detail fields; agents observe only
   inspect JSON fields, with per-agent dwell and verbatim idle timestamps.

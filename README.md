@@ -15,6 +15,7 @@ and interpreter resolver remain POSIX `sh` transition tooling.
 ## CLI
 
 The CLI observes and records without requiring a delivery backend.
+With no backend, registration and `status` explicitly say `delivery=none-configured`; reports remain available in the local watch log only.
 Optional delivery uses one direct-argv backend: `--deliver paseo-queue` pipes
 the report to `paseo-queue add <report-to>`, while `--deliver <command>` pipes
 it to an arbitrary executable. Terminal transitions are reported by default;
@@ -105,7 +106,7 @@ Kind floors and defaults:
 
 PBS probes treat the live `qstat -f` completion message
 `Job has finished, use -x or -H` as a positive terminal signal and perform a
-historical `qstat -x` lookup for the terminal state and exit details.
+historical `qstat -x -f` lookup for the terminal state and exit details.
 
 For an absence / receipt watch, key `file-exists` to a pre-agreed receipt path:
 
